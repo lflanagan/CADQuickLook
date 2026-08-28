@@ -1,0 +1,13 @@
+.DS_Store
+.codex/
+.build/
+CADQuickLook.xcodeproj/
+DerivedData/
+dist/
+*.xcresult
+*.p12
+*.provisionprofile
+*.mobileprovision
+*.xcuserstate
+xcuserdata/
+.swiftpm/

@@ -1,0 +1,122 @@
+name: CADQuickLook
+
+options:
+  bundleIdPrefix: com.liamflanagan
+  deploymentTarget:
+    macOS: "26.0"
+  xcodeVersion: "26.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    ARCHS: arm64
+    CLANG_CXX_LANGUAGE_STANDARD: c++20
+    HEADER_SEARCH_PATHS:
+      - $(inherited)
+      - /opt/homebrew/opt/opencascade/include/opencascade
+    LIBRARY_SEARCH_PATHS:
+      - $(inherited)
+      - /opt/homebrew/opt/opencascade/lib
+    LD_RUNPATH_SEARCH_PATHS:
+      - $(inherited)
+      - /opt/homebrew/opt/opencascade/lib
+      - "@executable_path/../Frameworks"
+    OTHER_LDFLAGS:
+      - $(inherited)
+      - -lTKDESTEP
+      - -lTKXCAF
+      - -lTKCAF
+      - -lTKLCAF
+      - -lTKCDF
+      - -lTKDEIGES
+      - -lTKDESTL
+      - -lTKDE
+      - -lTKXSBase
+      - -lTKMesh
+      - -lTKTopAlgo
+      - -lTKBRep
+      - -lTKGeomAlgo
+      - -lTKGeomBase
+      - -lTKG3d
+      - -lTKG2d
+      - -lTKMath
+      - -lTKernel
+    SWIFT_VERSION: "6.0"
+    CODE_SIGN_STYLE: Automatic
+
+targets:
+  CADQuickLook:
+    type: application
+    platform: macOS
+    sources:
+      - path: CADQuickLook
+        excludes:
+          - Bridge/CADQuickLook-Bridging-Header.h
+      - path: Shared
+    settings:
+      base:
+        CODE_SIGN_ENTITLEMENTS: CADQuickLook/CADQuickLook.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: com.liamflanagan.CADQuickLook
+        PRODUCT_NAME: CADQuickLook
+        ENABLE_APP_SANDBOX: NO
+        ENABLE_HARDENED_RUNTIME: YES
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: CADQuickLook/Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: CADQuickLook/Bridge/CADQuickLook-Bridging-Header.h
+    dependencies:
+      - target: CADQuickLookPreview
+        embed: true
+      - target: CADQuickLookThumbnail
+        embed: true
+
+  CADQuickLookPreview:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Extensions/Preview
+      - path: CADQuickLook/Bridge
+        excludes:
+          - CADQuickLook-Bridging-Header.h
+      - path: Shared
+    settings:
+      base:
+        CODE_SIGN_ENTITLEMENTS: Extensions/Extension.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: com.liamflanagan.CADQuickLook.Preview
+        PRODUCT_NAME: CADQuickLookPreview
+        ENABLE_APP_SANDBOX: YES
+        ENABLE_HARDENED_RUNTIME: YES
+        ENABLE_USER_SELECTED_FILES: readonly
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Extensions/Preview/Info.plist
+        SKIP_INSTALL: YES
+        SWIFT_OBJC_BRIDGING_HEADER: CADQuickLook/Bridge/CADQuickLook-Bridging-Header.h
+
+  CADQuickLookThumbnail:
+    type: app-extension
+    platform: macOS
+    sources:
+      - path: Extensions/Thumbnail
+      - path: CADQuickLook/Bridge
+        excludes:
+          - CADQuickLook-Bridging-Header.h
+      - path: Shared
+    settings:
+      base:
+        CODE_SIGN_ENTITLEMENTS: Extensions/Extension.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: com.liamflanagan.CADQuickLook.Thumbnail
+        PRODUCT_NAME: CADQuickLookThumbnail
+        ENABLE_APP_SANDBOX: YES
+        ENABLE_HARDENED_RUNTIME: YES
+        ENABLE_USER_SELECTED_FILES: readonly
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: Extensions/Thumbnail/Info.plist
+        SKIP_INSTALL: YES
+        SWIFT_OBJC_BRIDGING_HEADER: CADQuickLook/Bridge/CADQuickLook-Bridging-Header.h
+
+schemes:
+  CADQuickLook:
+    build:
+      targets:
+        CADQuickLook: all
+    run:
+      config: Debug

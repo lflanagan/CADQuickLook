@@ -1,0 +1,195 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+APP_NAME="CADQuickLook"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT="$ROOT_DIR/CADQuickLook.xcodeproj"
+DERIVED_DATA="$ROOT_DIR/.build/ReleaseDerivedData"
+BUILT_APP="$DERIVED_DATA/Build/Products/Release/$APP_NAME.app"
+DIST_DIR="$ROOT_DIR/dist"
+STAGE_DIR="$DIST_DIR/stage"
+APP_BUNDLE="$STAGE_DIR/$APP_NAME.app"
+FRAMEWORKS_DIR="$APP_BUNDLE/Contents/Frameworks"
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ROOT_DIR/CADQuickLook/Info.plist")"
+ARCHIVE="$DIST_DIR/$APP_NAME-$VERSION-arm64.zip"
+SIGNING_IDENTITY="${SIGNING_IDENTITY:-}"
+
+if [[ -z "$SIGNING_IDENTITY" ]]; then
+  echo "Set SIGNING_IDENTITY to a Developer ID Application certificate." >&2
+  exit 2
+fi
+
+if [[ "$SIGNING_IDENTITY" != "Developer ID Application:"* ]]; then
+  echo "GitHub release builds require a Developer ID Application certificate." >&2
+  exit 2
+fi
+
+if ! security find-identity -v -p codesigning | grep -Fq "\"$SIGNING_IDENTITY\""; then
+  echo "Signing identity is not valid or its private key is unavailable: $SIGNING_IDENTITY" >&2
+  exit 2
+fi
+
+EXPECTED_TEAM_ID="$(printf '%s\n' "$SIGNING_IDENTITY" | sed -E 's/^.*\(([A-Z0-9]{10})\)$/\1/')"
+if [[ ! "$EXPECTED_TEAM_ID" =~ ^[A-Z0-9]{10}$ ]]; then
+  echo "Signing identity must end with a 10-character Apple team ID." >&2
+  exit 2
+fi
+
+if [[ ! -d "$PROJECT" ]]; then
+  (cd "$ROOT_DIR" && xcodegen generate)
+fi
+
+xcodebuild \
+  -project "$PROJECT" \
+  -scheme "$APP_NAME" \
+  -configuration Release \
+  -derivedDataPath "$DERIVED_DATA" \
+  CODE_SIGNING_ALLOWED=NO \
+  build
+
+rm -rf "$STAGE_DIR"
+rm -f "$ARCHIVE"
+mkdir -p "$STAGE_DIR" "$FRAMEWORKS_DIR"
+/usr/bin/ditto "$BUILT_APP" "$APP_BUNDLE"
+mkdir -p "$APP_BUNDLE/Contents/Resources"
+cp "$ROOT_DIR/THIRD_PARTY_NOTICES.md" "$APP_BUNDLE/Contents/Resources/"
+
+declare -a queue=()
+declare -a source_names=()
+declare -a source_paths=()
+
+resolve_dependency() {
+  local dependency="$1"
+  local owner="$2"
+  local name="${dependency##*/}"
+  local candidate
+
+  if [[ "$dependency" == /opt/homebrew/* && -f "$dependency" ]]; then
+    printf '%s\n' "$dependency"
+    return
+  fi
+
+  if [[ "$dependency" == @rpath/* && -f "$(dirname "$owner")/$name" ]]; then
+    printf '%s\n' "$(dirname "$owner")/$name"
+    return
+  fi
+
+  candidate="$(find -L /opt/homebrew/opt -path "*/lib/$name" -type f -print -quit 2>/dev/null || true)"
+  [[ -n "$candidate" ]] && printf '%s\n' "$candidate"
+  return 0
+}
+
+enqueue_dependencies() {
+  local owner="$1"
+  local dependency source name
+
+  while IFS= read -r dependency; do
+    [[ -n "$dependency" ]] || continue
+    case "$dependency" in
+      /opt/homebrew/*|@rpath/*) ;;
+      *) continue ;;
+    esac
+    source="$(resolve_dependency "$dependency" "$owner")"
+    [[ -n "$source" ]] || continue
+    name="${dependency##*/}"
+    found=false
+    for known_name in "${source_names[@]:-}"; do
+      if [[ "$known_name" == "$name" ]]; then
+        found=true
+        break
+      fi
+    done
+    if [[ "$found" == false ]]; then
+      source_names+=("$name")
+      source_paths+=("$source")
+      queue+=("$name")
+    fi
+  done < <(otool -L "$owner" | tail -n +2 | awk '{print $1}')
+}
+
+while IFS= read -r -d '' binary; do
+  if file "$binary" | grep -q 'Mach-O'; then
+    enqueue_dependencies "$binary"
+  fi
+done < <(find "$APP_BUNDLE" -type f -print0)
+
+index=0
+while (( index < ${#queue[@]} )); do
+  name="${queue[$index]}"
+  source=""
+  for ((source_index = 0; source_index < ${#source_names[@]}; source_index += 1)); do
+    if [[ "${source_names[$source_index]}" == "$name" ]]; then
+      source="${source_paths[$source_index]}"
+      break
+    fi
+  done
+  [[ -n "$source" ]] || { echo "Unable to resolve $name" >&2; exit 1; }
+  destination="$FRAMEWORKS_DIR/$name"
+  cp -L "$source" "$destination"
+  chmod u+w "$destination"
+  install_name_tool -id "@rpath/$name" "$destination"
+  enqueue_dependencies "$source"
+  ((index += 1))
+done
+
+while IFS= read -r -d '' binary; do
+  if ! file "$binary" | grep -q 'Mach-O'; then
+    continue
+  fi
+
+  while IFS= read -r dependency; do
+    name="${dependency##*/}"
+    if [[ -f "$FRAMEWORKS_DIR/$name" && "$dependency" != "@rpath/$name" ]]; then
+      install_name_tool -change "$dependency" "@rpath/$name" "$binary"
+    fi
+  done < <(otool -L "$binary" | tail -n +2 | awk '{print $1}')
+
+  install_name_tool -delete_rpath /opt/homebrew/opt/opencascade/lib "$binary" 2>/dev/null || true
+done < <(find "$APP_BUNDLE" -type f -print0)
+
+while IFS= read -r -d '' library; do
+  codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$library"
+done < <(find "$FRAMEWORKS_DIR" -type f -name '*.dylib' -print0)
+
+while IFS= read -r -d '' extension; do
+  codesign \
+    --force \
+    --options runtime \
+    --timestamp \
+    --entitlements "$ROOT_DIR/Extensions/Extension.entitlements" \
+    --sign "$SIGNING_IDENTITY" \
+    "$extension"
+done < <(find "$APP_BUNDLE/Contents/PlugIns" -type d -name '*.appex' -print0)
+
+codesign \
+  --force \
+  --options runtime \
+  --timestamp \
+  --entitlements "$ROOT_DIR/CADQuickLook/CADQuickLook.entitlements" \
+  --sign "$SIGNING_IDENTITY" \
+  "$APP_BUNDLE"
+
+codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+
+for signed_item in \
+  "$APP_BUNDLE" \
+  "$APP_BUNDLE"/Contents/PlugIns/*.appex \
+  "$FRAMEWORKS_DIR"/*.dylib; do
+  actual_team="$(codesign -dvv "$signed_item" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2}')"
+  if [[ "$actual_team" != "$EXPECTED_TEAM_ID" ]]; then
+    echo "Unexpected signing team on $signed_item: $actual_team" >&2
+    exit 1
+  fi
+done
+
+/usr/bin/ditto -c -k --keepParent --sequesterRsrc "$APP_BUNDLE" "$ARCHIVE"
+
+if [[ -n "${NOTARY_PROFILE:-}" ]]; then
+  xcrun notarytool submit "$ARCHIVE" --keychain-profile "$NOTARY_PROFILE" --wait
+  xcrun stapler staple "$APP_BUNDLE"
+  rm -f "$ARCHIVE"
+  /usr/bin/ditto -c -k --keepParent --sequesterRsrc "$APP_BUNDLE" "$ARCHIVE"
+  spctl --assess --type execute --verbose=2 "$APP_BUNDLE"
+fi
+
+echo "$ARCHIVE"
