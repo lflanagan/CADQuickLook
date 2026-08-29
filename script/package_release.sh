@@ -114,6 +114,8 @@ enqueue_dependencies() {
   while IFS= read -r dependency; do
     [[ -n "$dependency" ]] || continue
     case "$dependency" in
+      # Frameworks (Sparkle) are embedded by Xcode; only loose dylibs are bundled here.
+      @rpath/*.framework/*) continue ;;
       /opt/homebrew/*|@rpath/*) ;;
       *) continue ;;
     esac
