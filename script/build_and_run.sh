@@ -26,7 +26,8 @@ BUILD_ARGS=(
 )
 
 if [[ -n "${DEVELOPMENT_TEAM:-}" ]]; then
-  BUILD_ARGS+=(DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM")
+  # Sign with the team's Apple Development certificate (see project.yml).
+  BUILD_ARGS+=(DEVELOPMENT_TEAM="$DEVELOPMENT_TEAM" CODE_SIGN_IDENTITY="Apple Development")
 fi
 
 xcodebuild "${BUILD_ARGS[@]}" build

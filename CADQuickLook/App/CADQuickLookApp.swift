@@ -37,6 +37,7 @@ final class CADApplicationDelegate: NSObject, NSApplicationDelegate {
 struct CADQuickLookApp: App {
     @NSApplicationDelegateAdaptor(CADApplicationDelegate.self) private var appDelegate
     @State private var store = CADDocumentStore()
+    @State private var updater = UpdaterController()
 
     var body: some Scene {
         WindowGroup {
@@ -55,10 +56,16 @@ struct CADQuickLookApp: App {
                 }
                 .keyboardShortcut("o")
             }
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    updater.checkForUpdates()
+                }
+                .disabled(!updater.canCheckForUpdates)
+            }
         }
 
         Settings {
-            SettingsView()
+            SettingsView(updater: updater)
         }
     }
 }

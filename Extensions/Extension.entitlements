@@ -8,5 +8,9 @@
     <true/>
     <key>com.apple.security.cs.disable-library-validation</key>
     <true/>
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>$(CAD_APP_GROUP)</string>
+    </array>
 </dict>
 </plist>

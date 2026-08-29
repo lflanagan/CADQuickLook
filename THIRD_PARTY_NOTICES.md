@@ -6,6 +6,8 @@ The release archive dynamically links Open CASCADE libraries. Source and build i
 
 The full Open CASCADE license is included with its source distribution.
 
+The app bundles [Sparkle](https://sparkle-project.org/) 2.9.6 for software updates, distributed under the MIT License. Sparkle additionally includes Ed25519 code by Daniel J. Bernstein et al. (public domain) and the bspatch/bsdiff code by Colin Percival (BSD 2-Clause); see Sparkle's LICENSE file.
+
 Release archives also include these dynamically linked dependencies:
 
 - [oneTBB](https://github.com/uxlfoundation/oneTBB), Apache License 2.0
