@@ -11,6 +11,16 @@ final class InteractiveCADView: SCNView {
             } ?? 1
         }
     }
+    /// Mirrors the scene's display options so picking ignores tangent edges
+    /// when they are removed. (Edges hidden by "Shaded without edges" stay
+    /// pickable, as in Onshape.)
+    private(set) var displayOptions = CADDisplayOptions.default
+
+    func applyDisplayOptions(_ options: CADDisplayOptions) {
+        displayOptions = options
+        if let scene { CADSceneFactory.apply(options, to: scene) }
+    }
+
     var onHover: ((SmartSelectionTarget?) -> Void)?
     var onSelect: ((SmartSelectionTarget) -> Void)?
     var onCameraOrientationChanged: ((simd_quatf) -> Void)? {
@@ -36,6 +46,29 @@ final class InteractiveCADView: SCNView {
     }()
 
     override var acceptsFirstResponder: Bool { true }
+
+    /// Text placed on the pasteboard by Cmd+C / Edit > Copy; nil when there is
+    /// nothing to copy.
+    var onCopy: (() -> String?)?
+
+    @objc func copy(_ sender: Any?) {
+        guard let text = onCopy?() else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    /// Quick Look hosts the view remotely, where the Edit menu is Finder's;
+    /// handle the key equivalent directly so copying works there too.
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            .subtracting([.capsLock, .numericPad, .function])
+        if flags == .command, event.charactersIgnoringModifiers?.lowercased() == "c", onCopy?() != nil {
+            copy(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
 
     isolated deinit {
         cameraAnimation?.invalidate()
@@ -241,9 +274,19 @@ final class InteractiveCADView: SCNView {
     }
 
     func snap(to standardView: CADStandardView) {
+        snap(to: CADSceneFactory.cameraOrientation(for: isPlanar ? .top : standardView))
+    }
+
+    /// Snaps to the view looking from `offset` (a corner of the view cube) at the part.
+    func snap(toCameraOffset offset: SIMD3<Float>) {
+        guard !isPlanar else { return }
+        snap(to: CADSceneFactory.cameraOrientation(offset: offset))
+    }
+
+    private func snap(to targetOrientation: simd_quatf) {
         guard let camera = cameraNode, let target = targetNode else { return }
         let radius = max(simd_length(camera.simdPosition - target.simdPosition), 1)
-        var orientation = CADSceneFactory.cameraOrientation(for: isPlanar ? .top : standardView)
+        var orientation = targetOrientation
         // Take the short way round when interpolating.
         if simd_dot(orientation.vector, camera.simdOrientation.vector) < 0 {
             orientation = simd_quatf(vector: -orientation.vector)
@@ -456,7 +499,7 @@ final class InteractiveCADView: SCNView {
         let visibleDepth = faceHit.flatMap { projector.project($0.worldCoordinates.simdVector)?.depth }
         if let vertex = nearestVertex(to: screenPoint, noFartherThan: visibleDepth, projector: projector) { return vertex }
         if let edge = nearestEdge(to: screenPoint, noFartherThan: visibleDepth, projector: projector) { return edge }
-        guard let faceHit, let asset, asset.triangles.indices.contains(faceHit.faceIndex) else { return nil }
+        guard let faceHit, let asset, !asset.isMesh, asset.triangles.indices.contains(faceHit.faceIndex) else { return nil }
         return .face(index: Int(asset.triangles[faceHit.faceIndex].faceIndex), position: faceHit.worldCoordinates)
     }
 
@@ -534,7 +577,9 @@ final class InteractiveCADView: SCNView {
         var bestPoint = SCNVector3Zero
         let points = asset.polylineSimd
 
+        let skipsTangent = displayOptions.tangentEdges == .removed
         for (edgeIndex, edge) in asset.edges.enumerated() {
+            if skipsTangent, edge.isTangent != 0 { continue }
             let first = Int(edge.firstPoint)
             let count = Int(edge.pointCount)
             guard count > 1, first + count <= points.count else { continue }
@@ -649,10 +694,7 @@ private final class CADVectorOverlayView: NSView {
         stroke(points: selectionPoints, lineWidth: 4)
 
         if let vertexPoint {
-            let ring = NSBezierPath(ovalIn: NSRect(x: vertexPoint.x - 6, y: vertexPoint.y - 6, width: 12, height: 12))
-            ring.lineWidth = 2
-            ring.stroke()
-            NSBezierPath(ovalIn: NSRect(x: vertexPoint.x - 2.5, y: vertexPoint.y - 2.5, width: 5, height: 5)).fill()
+            NSBezierPath(ovalIn: NSRect(x: vertexPoint.x - 4, y: vertexPoint.y - 4, width: 8, height: 8)).fill()
         }
     }
 
@@ -687,8 +729,6 @@ private final class CADVectorOverlayView: NSView {
             )
         }
         if let originPoint {
-            NSColor.black.withAlphaComponent(0.5).setFill()
-            NSBezierPath(ovalIn: NSRect(x: originPoint.x - 4.5, y: originPoint.y - 4.5, width: 9, height: 9)).fill()
             NSColor.white.setFill()
             NSBezierPath(ovalIn: NSRect(x: originPoint.x - 3, y: originPoint.y - 3, width: 6, height: 6)).fill()
         }

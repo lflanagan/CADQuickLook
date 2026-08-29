@@ -12,6 +12,9 @@
 #include <Bnd_Box.hxx>
 #include <GCPnts_QuasiUniformDeflection.hxx>
 #include <GProp_GProps.hxx>
+#include <Geom2d_Curve.hxx>
+#include <GeomLProp_SLProps.hxx>
+#include <Geom_Surface.hxx>
 #include <IGESControl_Reader.hxx>
 #include <IFSelect_ReturnStatus.hxx>
 #include <Poly_Triangulation.hxx>
@@ -23,13 +26,17 @@
 #include <IMeshTools_Parameters.hxx>
 #include <STEPControl_Reader.hxx>
 #include <Standard_Failure.hxx>
-#include <StlAPI_Reader.hxx>
+#include <RWStl.hxx>
 #include <TDF_LabelSequence.hxx>
 #include <TDocStd_Document.hxx>
 #include <TopAbs_Orientation.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
+#include <TopLoc_Location.hxx>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
 #include <TopTools_IndexedMapOfShape.hxx>
+#include <TopTools_ListOfShape.hxx>
+#include <gp_Pnt2d.hxx>
 #include <TopoDS.hxx>
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
@@ -194,12 +201,6 @@ bool importShape(CADBridgeModel& model,
         BRep_Builder builder;
         if (!BRepTools::Read(shape, nativePath.c_str(), builder)) {
             error = "Open CASCADE could not parse the BREP file.";
-            return false;
-        }
-    } else if (extension == ".stl") {
-        StlAPI_Reader reader;
-        if (!reader.Read(shape, nativePath.c_str())) {
-            error = "Open CASCADE could not parse the STL file.";
             return false;
         }
     } else {
@@ -385,6 +386,50 @@ void appendEdgeSamples(const TopoDS_Edge& edge, double deflection, std::vector<C
     }
 }
 
+/// Whether the faces on either side of `edge` meet smoothly (G1) along it.
+uint8_t isTangentEdge(const TopoDS_Edge& edge, const TopTools_ListOfShape* faces) {
+    if (!faces || faces->Extent() < 1 || faces->Extent() > 2) return 0;
+    const TopoDS_Face faceA = TopoDS::Face(faces->First());
+    const TopoDS_Face faceB = TopoDS::Face(faces->Last());
+    if (faces->Extent() == 1 || faceA.IsSame(faceB)) {
+        // A seam: one periodic surface (cylinder, torus...) wraps round to
+        // meet itself. Smooth by construction; a free boundary edge is not.
+        return (faces->Extent() == 2 || BRep_Tool::IsClosed(edge, faceA)) ? 1 : 0;
+    }
+    try {
+        Standard_Real firstA, lastA, firstB, lastB;
+        const Handle(Geom2d_Curve) pcurveA = BRep_Tool::CurveOnSurface(edge, faceA, firstA, lastA);
+        const Handle(Geom2d_Curve) pcurveB = BRep_Tool::CurveOnSurface(edge, faceB, firstB, lastB);
+        if (pcurveA.IsNull() || pcurveB.IsNull()) return 0;
+        TopLoc_Location locationA, locationB;
+        const Handle(Geom_Surface) surfaceA = BRep_Tool::Surface(faceA, locationA);
+        const Handle(Geom_Surface) surfaceB = BRep_Tool::Surface(faceB, locationB);
+        if (surfaceA.IsNull() || surfaceB.IsNull()) return 0;
+
+        // Normals within 1.5° at three points along the edge count as tangent.
+        const double threshold = std::cos(1.5 * M_PI / 180.0);
+        for (const double t : {0.15, 0.5, 0.85}) {
+            const gp_Pnt2d uvA = pcurveA->Value(firstA + t * (lastA - firstA));
+            const gp_Pnt2d uvB = pcurveB->Value(firstB + t * (lastB - firstB));
+            GeomLProp_SLProps propsA(surfaceA, uvA.X(), uvA.Y(), 1, Precision::Confusion());
+            GeomLProp_SLProps propsB(surfaceB, uvB.X(), uvB.Y(), 1, Precision::Confusion());
+            if (!propsA.IsNormalDefined() || !propsB.IsNormalDefined()) return 0;
+            gp_Dir normalA = propsA.Normal();
+            gp_Dir normalB = propsB.Normal();
+            normalA.Transform(locationA.Transformation());
+            normalB.Transform(locationB.Transformation());
+            // Compare outward normals, so the front and back of a sheet body
+            // (anti-parallel) stay a sharp boundary.
+            if (faceA.Orientation() == TopAbs_REVERSED) normalA.Reverse();
+            if (faceB.Orientation() == TopAbs_REVERSED) normalB.Reverse();
+            if (normalA.Dot(normalB) < threshold) return 0;
+        }
+        return 1;
+    } catch (const Standard_Failure&) {
+        return 0;
+    }
+}
+
 void buildEdges(CADBridgeModel& model, double edgeDeflection) {
     model.edges.clear();
     model.edgeShapes.clear();
@@ -392,6 +437,8 @@ void buildEdges(CADBridgeModel& model, double edgeDeflection) {
 
     TopTools_IndexedMapOfShape edgeMap;
     TopExp::MapShapes(model.shape, TopAbs_EDGE, edgeMap);
+    TopTools_IndexedDataMapOfShapeListOfShape edgeFaces;
+    TopExp::MapShapesAndAncestors(model.shape, TopAbs_EDGE, TopAbs_FACE, edgeFaces);
     model.edges.reserve(static_cast<size_t>(edgeMap.Extent()));
     model.edgeShapes.reserve(static_cast<size_t>(edgeMap.Extent()));
 
@@ -410,17 +457,90 @@ void buildEdges(CADBridgeModel& model, double edgeDeflection) {
         uint8_t isCircular = 0;
         double exactDiameter = 0.0;
         exactCircularEdgeMetadata(edge, isCircular, exactDiameter);
+        const TopTools_ListOfShape* faces = edgeFaces.Contains(edge) ? &edgeFaces.FindFromKey(edge) : nullptr;
         model.edges.push_back({
             firstPoint,
             pointCount,
             -1.0, // exact length is computed on demand (CADBridgeModelEdgeLength)
             isCircular,
-            exactDiameter
+            exactDiameter,
+            isTangentEdge(edge, faces)
         });
     }
 }
 
+/// Loads an STL as a bare mesh: one display "face" holding every triangle,
+/// no B-Rep and no edges. Going through StlAPI_Reader instead would build a
+/// B-Rep face per triangle, which takes minutes on scan data and crashes
+/// inside BRepLib_MakeFace on degenerate triangles.
+bool loadStlMesh(CADBridgeModel& model, const std::filesystem::path& path, std::string& error) {
+    Handle(BridgeProgressIndicator) progress = new BridgeProgressIndicator(model, CADLoadStageReading, 0);
+    // Nodes are shared only across gentle (<30°) angles, so smoothed normals
+    // do not soften the sharp edges of machined parts.
+    const Handle(Poly_Triangulation) mesh = RWStl::ReadFile(path.c_str(), 30.0 * M_PI / 180.0, progress->Start());
+    if (mesh.IsNull() || mesh->NbTriangles() == 0 || mesh->NbNodes() == 0) {
+        error = "Open CASCADE could not parse the STL file.";
+        return false;
+    }
+    const uint32_t triangleCount = static_cast<uint32_t>(mesh->NbTriangles());
+    reportProgress(model, CADLoadStageBuildingMesh, -1.0, triangleCount);
+    mesh->ComputeNormals();
+
+    model.vertices.reserve(static_cast<size_t>(mesh->NbNodes()));
+    for (Standard_Integer node = 1; node <= mesh->NbNodes(); ++node) {
+        const gp_Pnt position = mesh->Node(node);
+        gp_Vec3f raw(0.0f, 0.0f, 1.0f);
+        if (mesh->HasNormals()) mesh->Normal(node, raw);
+        // Nodes used only by collinear triangles get a zero normal; gp_Dir would throw.
+        const float modulus = raw.Modulus();
+        const gp_Vec3f normal = modulus > 0.0f ? raw / modulus : gp_Vec3f(0.0f, 0.0f, 1.0f);
+        model.vertices.push_back({
+            static_cast<float>(position.X()), static_cast<float>(position.Y()), static_cast<float>(position.Z()),
+            normal.x(), normal.y(), normal.z()
+        });
+    }
+
+    double area = 0.0;
+    model.triangles.reserve(triangleCount);
+    for (Standard_Integer index = 1; index <= mesh->NbTriangles(); ++index) {
+        Standard_Integer a, b, c;
+        mesh->Triangle(index).Get(a, b, c);
+        if (a == b || b == c || a == c) continue;
+        const gp_XYZ ab = mesh->Node(b).XYZ() - mesh->Node(a).XYZ();
+        const gp_XYZ ac = mesh->Node(c).XYZ() - mesh->Node(a).XYZ();
+        area += ab.Crossed(ac).Modulus() * 0.5;
+        model.triangles.push_back({
+            static_cast<uint32_t>(a - 1), static_cast<uint32_t>(b - 1), static_cast<uint32_t>(c - 1), 0
+        });
+    }
+    if (model.triangles.empty()) {
+        error = "The STL file did not contain any display triangles.";
+        return false;
+    }
+    model.faceRanges.push_back({0, static_cast<uint32_t>(model.triangles.size()), area});
+    return true;
+}
+
+/// Shrinks the bounds to the display mesh (B-Rep bounds are pole-loose).
+void tightenBounds(CADBridgeModel& model) {
+    if (model.vertices.empty()) return;
+    CADBounds tight{};
+    tight.minimum = {model.vertices[0].x, model.vertices[0].y, model.vertices[0].z};
+    tight.maximum = tight.minimum;
+    for (const CADVertex& v : model.vertices) {
+        tight.minimum.x = std::min(tight.minimum.x, static_cast<double>(v.x));
+        tight.minimum.y = std::min(tight.minimum.y, static_cast<double>(v.y));
+        tight.minimum.z = std::min(tight.minimum.z, static_cast<double>(v.z));
+        tight.maximum.x = std::max(tight.maximum.x, static_cast<double>(v.x));
+        tight.maximum.y = std::max(tight.maximum.y, static_cast<double>(v.y));
+        tight.maximum.z = std::max(tight.maximum.z, static_cast<double>(v.z));
+    }
+    tight.isValid = 1;
+    model.bounds = tight;
+}
+
 uint32_t countSubshapes(const TopoDS_Shape& shape, TopAbs_ShapeEnum type) {
+    if (shape.IsNull()) return 0;
     TopTools_IndexedMapOfShape map;
     TopExp::MapShapes(shape, type, map);
     return static_cast<uint32_t>(map.Extent());
@@ -428,10 +548,11 @@ uint32_t countSubshapes(const TopoDS_Shape& shape, TopAbs_ShapeEnum type) {
 
 CADModelStats computeStats(const CADBridgeModel& model) {
     CADModelStats stats{};
-    stats.faceCount = static_cast<uint32_t>(model.faces.size());
+    stats.faceCount = static_cast<uint32_t>(model.faceRanges.size());
     stats.edgeCount = static_cast<uint32_t>(model.edges.size());
-    stats.vertexCount = countSubshapes(model.shape, TopAbs_VERTEX);
-    stats.shellCount = countSubshapes(model.shape, TopAbs_SHELL);
+    stats.vertexCount = model.shape.IsNull()
+        ? static_cast<uint32_t>(model.vertices.size()) : countSubshapes(model.shape, TopAbs_VERTEX);
+    stats.shellCount = model.shape.IsNull() ? 1 : countSubshapes(model.shape, TopAbs_SHELL);
     stats.solidCount = countSubshapes(model.shape, TopAbs_SOLID);
     stats.triangleCount = static_cast<uint32_t>(model.triangles.size());
     // Total edge length, surface area and volume are not displayed anywhere
@@ -472,6 +593,17 @@ CADBridgeStatus CADBridgeModelLoad(CADBridgeModel *model, const char *pathUTF8, 
             return fail(*model, CADBridgeStatusFileNotFound, "The CAD file does not exist or is not a regular file.");
         }
 
+        if (lowercaseExtension(path) == ".stl") {
+            std::string meshError;
+            if (!loadStlMesh(*model, path, meshError)) {
+                return fail(*model, CADBridgeStatusImportFailed, std::move(meshError));
+            }
+            tightenBounds(*model);
+            reportProgress(*model, CADLoadStageFinishing, -1.0);
+            model->stats = computeStats(*model);
+            return CADBridgeStatusOK;
+        }
+
         std::string importError;
         bool imported = false;
         {
@@ -482,7 +614,7 @@ CADBridgeStatus CADBridgeModelLoad(CADBridgeModel *model, const char *pathUTF8, 
             const std::string extension = lowercaseExtension(path);
             const bool unsupported = extension != ".step" && extension != ".stp" &&
                                      extension != ".iges" && extension != ".igs" &&
-                                     extension != ".brep" && extension != ".rle" && extension != ".stl";
+                                     extension != ".brep" && extension != ".rle";
             return fail(*model, unsupported ? CADBridgeStatusUnsupportedFormat : CADBridgeStatusImportFailed,
                         std::move(importError));
         }
@@ -515,21 +647,7 @@ CADBridgeStatus CADBridgeModelLoad(CADBridgeModel *model, const char *pathUTF8, 
 
         buildMesh(*model);
         buildEdges(*model, edgeDeflection);
-        if (!model->vertices.empty()) {
-            CADBounds tight{};
-            tight.minimum = {model->vertices[0].x, model->vertices[0].y, model->vertices[0].z};
-            tight.maximum = tight.minimum;
-            for (const CADVertex& v : model->vertices) {
-                tight.minimum.x = std::min(tight.minimum.x, static_cast<double>(v.x));
-                tight.minimum.y = std::min(tight.minimum.y, static_cast<double>(v.y));
-                tight.minimum.z = std::min(tight.minimum.z, static_cast<double>(v.z));
-                tight.maximum.x = std::max(tight.maximum.x, static_cast<double>(v.x));
-                tight.maximum.y = std::max(tight.maximum.y, static_cast<double>(v.y));
-                tight.maximum.z = std::max(tight.maximum.z, static_cast<double>(v.z));
-            }
-            tight.isValid = 1;
-            model->bounds = tight;
-        }
+        tightenBounds(*model);
         reportProgress(*model, CADLoadStageFinishing, -1.0);
         model->stats = computeStats(*model);
         if (model->triangles.empty()) {
@@ -609,11 +727,13 @@ void CADBridgeModelSetProgressCallback(CADBridgeModel *model, CADBridgeProgressC
 
 CADBridgeStatus CADBridgeModelFaceArea(CADBridgeModel *model, uint32_t faceIndex, double *outArea) {
     if (!model || !outArea) return CADBridgeStatusInvalidArgument;
-    if (faceIndex >= model->faces.size()) return CADBridgeStatusOutOfRange;
+    if (faceIndex >= model->faceRanges.size()) return CADBridgeStatusOutOfRange;
     CADFaceRange& range = model->faceRanges[faceIndex];
     if (range.exactArea < 0.0) {
         try {
-            range.exactArea = exactFaceArea(model->faces[faceIndex]);
+            // Mesh-only models (STL) have no B-Rep face; their area was
+            // summed from the triangles at load time.
+            range.exactArea = faceIndex < model->faces.size() ? exactFaceArea(model->faces[faceIndex]) : 0.0;
         } catch (const Standard_Failure&) {
             range.exactArea = 0.0;
         }

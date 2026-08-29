@@ -199,6 +199,7 @@ enum CADValueFormatter {
     private static func formatter(for unit: CADLengthUnit) -> NumberFormatter {
         let formatter = NumberFormatter()
         formatter.numberStyle = .decimal
+        formatter.usesGroupingSeparator = false
         formatter.maximumFractionDigits = unit.fractionDigits
         formatter.minimumFractionDigits = 0
         return formatter

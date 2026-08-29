@@ -96,6 +96,10 @@ typedef struct CADEdgePolyline {
     uint8_t isCircular;
     /// Exact circle diameter in model units, or 0 for non-circular edges.
     double exactDiameter;
+    /// 1 when the two faces meeting at this edge are tangent across it (a
+    /// fillet boundary, a cylinder seam): a "tangent edge" that CAD viewers
+    /// usually draw faintly or not at all. 0 for sharp and free edges.
+    uint8_t isTangent;
 } CADEdgePolyline;
 
 typedef struct CADBounds {

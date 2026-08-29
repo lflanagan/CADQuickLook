@@ -53,6 +53,16 @@ struct ContentView: View {
         }
         .toolbar(removing: .title)
         .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        .overlay(alignment: .bottomLeading) {
+            Text(CADBuildInfo.stamp)
+                .font(.custom("Helvetica", size: 10))
+                .foregroundStyle(.tertiary)
+                .opacity(0.6)
+                .padding(.leading, 14)
+                .padding(.bottom, 10)
+                .allowsHitTesting(false)
+        }
+        .background(CADGlassBackground().ignoresSafeArea())
     }
 }
 

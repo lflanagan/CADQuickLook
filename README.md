@@ -6,8 +6,10 @@ A native macOS viewer for STEP, IGES, BREP, STL, and DXF files, with Finder thum
 
 - Perspective and orthographic views
 - Onshape-style navigation and standard view snaps
-- Automatic edge, diameter, face-area, and point-to-point measurements
+- Automatic edge, diameter, face-area, and point-to-point measurements; ⌘C copies the value with its unit
+- Display options: shaded with or without edges, unshaded, translucent; hidden edges visible or removed; tangent edges visible, phantom, or removed
 - STEP assembly placement through Open CASCADE
+- STL files are viewed as meshes: no edges or measurements, but multi-million-triangle scans open in seconds
 - The same viewer and controls in the app and Quick Look
 
 ## Install
@@ -39,7 +41,7 @@ SIGNING_IDENTITY="Developer ID Application: …" ./script/package_release.sh
 
 ### Publishing a release
 
-1. Bump `CFBundleShortVersionString` and `CFBundleVersion` (kept equal) in `CADQuickLook/Info.plist`.
+1. `./script/bump_version.sh X.Y.Z` sets `CFBundleShortVersionString` and `CFBundleVersion` (kept equal) in the app and both extension `Info.plist`s. Without an argument it bumps the patch component, which is what dev builds do.
 2. `SIGNING_IDENTITY="Developer ID Application: …" NOTARY_PROFILE=… ./script/package_release.sh`
 3. `gh release create vX.Y.Z dist/CADQuickLook-X.Y.Z-arm64.zip --title "CADQuickLook X.Y.Z" --notes-file notes.md`
 4. The `Publish Sparkle appcast` workflow signs the archive with the Ed25519 key in the `SPARKLE_PRIVATE_KEY` repository secret and uploads `appcast.xml` to the release, which the app reads from `releases/latest/download/appcast.xml`. To do the same locally with the key in your Keychain, run `./script/publish_appcast.sh vX.Y.Z`.

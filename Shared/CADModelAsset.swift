@@ -126,6 +126,9 @@ final class CADModelAsset: @unchecked Sendable {
     /// True for 2D drawings (DXF): the viewer locks to a top-down orthographic
     /// view and there are no faces.
     let isPlanar: Bool
+    /// A triangle soup (STL): one display face, no B-Rep edges or vertices, so
+    /// there is nothing meaningful to pick.
+    var isMesh: Bool { url.pathExtension.lowercased() == "stl" }
 
     /// Open CASCADE model, or nil for drawings parsed in Swift.
     private let handle: OpaquePointer?
@@ -158,7 +161,8 @@ final class CADModelAsset: @unchecked Sendable {
                     pointCount: UInt32(edge.points.count),
                     exactLength: edge.length * scale,
                     isCircular: edge.isCircular ? 1 : 0,
-                    exactDiameter: edge.diameter * scale
+                    exactDiameter: edge.diameter * scale,
+                    isTangent: 0
                 ))
             }
             handle = nil

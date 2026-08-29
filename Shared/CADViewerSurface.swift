@@ -1,11 +1,11 @@
 import AppKit
 import SceneKit
 
-/// Viewer surface shared by the app and Quick Look extension.
+/// Viewer content shared by the app and Quick Look extension. Draws nothing of
+/// its own: it is transparent and sits on a `CADGlassBackdrop` supplied by the host.
 @MainActor
-final class CADViewerSurface: NSGlassEffectView {
+final class CADViewerSurface: NSView {
     private let sceneView = InteractiveCADView()
-    private let viewerContent = NSView()
     private let viewCube = CADOrientationWidgetView()
     private let resultCard = NSView()
     private let titleLabel = NSTextField(labelWithString: "")
@@ -18,6 +18,13 @@ final class CADViewerSurface: NSGlassEffectView {
     private var lastResult: SmartMeasurementResult?
     private let loadingLabel = NSTextField(labelWithString: "")
     private let loadingBar = NSProgressIndicator()
+    private let buildStampLabel = NSTextField(labelWithString: CADBuildInfo.stamp)
+
+    /// Shows the build stamp in the bottom-left corner. The app draws its own
+    /// (in every window state), so only Quick Look turns this on.
+    var showsBuildStamp = false {
+        didSet { buildStampLabel.isHidden = !showsBuildStamp }
+    }
 
     private(set) var representedURL: URL?
 
@@ -36,29 +43,15 @@ final class CADViewerSurface: NSGlassEffectView {
             name: .cadLengthUnitDidChange,
             object: nil
         )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(displayOptionsDidChange(_:)),
+            name: .cadDisplayOptionsDidChange,
+            object: nil
+        )
     }
 
     required init?(coder: NSCoder) { nil }
-
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        refreshGlassPassThrough()
-        Task { @MainActor [weak self] in
-            self?.refreshGlassPassThrough()
-        }
-    }
-
-    func refreshGlassPassThrough() {
-        guard let window else { return }
-        window.isOpaque = false
-        window.backgroundColor = .clear
-
-        guard Bundle.main.bundleIdentifier == CADPreferences.suiteName else { return }
-        window.styleMask.insert(.fullSizeContentView)
-        window.titlebarAppearsTransparent = true
-        window.titleVisibility = .hidden
-        cornerRadius = 0
-    }
 
     /// Shows a loading status over the (empty) viewer; pass nil to hide it.
     func showLoading(_ status: String?, fraction: Double? = nil) {
@@ -78,8 +71,10 @@ final class CADViewerSurface: NSGlassEffectView {
     func display(_ asset: CADModelAsset) {
         showLoading(nil)
         representedURL = asset.url
-        let scene = CADSceneFactory.makeScene(for: asset)
+        let options = CADPreferences.displayOptions
+        let scene = CADSceneFactory.makeScene(for: asset, options: options)
         sceneView.scene = scene
+        sceneView.applyDisplayOptions(options)
         sceneView.asset = asset
         sceneView.pointOfView = scene.rootNode.childNode(withName: "Camera", recursively: true)
         viewCube.isPlanar = asset.isPlanar
@@ -98,6 +93,8 @@ final class CADViewerSurface: NSGlassEffectView {
         show(nil)
 
         viewCube.onSnap = sceneView.snap
+        viewCube.onSnapCorner = sceneView.snap(toCameraOffset:)
+        sceneView.onCopy = { [weak self] in self?.lastResult?.primaryValue.formatted }
         viewCube.onProjectionChange = sceneView.setCameraProjection
         sceneView.onCameraOrientationChanged = { [weak viewCube] orientation in
             viewCube?.cameraOrientation = orientation
@@ -105,11 +102,8 @@ final class CADViewerSurface: NSGlassEffectView {
     }
 
     private func configureView() {
-        style = .regular
-        cornerRadius = 22
-        viewerContent.wantsLayer = true
-        viewerContent.layer?.backgroundColor = NSColor.clear.cgColor
-        contentView = viewerContent
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
 
         sceneView.translatesAutoresizingMaskIntoConstraints = false
         sceneView.allowsCameraControl = false
@@ -118,10 +112,10 @@ final class CADViewerSurface: NSGlassEffectView {
         sceneView.backgroundColor = .clear
         sceneView.rendersContinuously = false
         sceneView.preferredFramesPerSecond = 60
-        viewerContent.addSubview(sceneView)
+        addSubview(sceneView)
 
         viewCube.translatesAutoresizingMaskIntoConstraints = false
-        viewerContent.addSubview(viewCube)
+        addSubview(viewCube)
         configureResultCard()
 
         loadingLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -134,21 +128,30 @@ final class CADViewerSurface: NSGlassEffectView {
         loadingBar.minValue = 0
         loadingBar.maxValue = 1
         loadingBar.isHidden = true
-        viewerContent.addSubview(loadingBar)
-        viewerContent.addSubview(loadingLabel)
+        addSubview(loadingBar)
+        addSubview(loadingLabel)
+
+        buildStampLabel.translatesAutoresizingMaskIntoConstraints = false
+        buildStampLabel.font = helvetica(size: 10)
+        buildStampLabel.textColor = .tertiaryLabelColor
+        buildStampLabel.alphaValue = 0.6
+        buildStampLabel.isHidden = true
+        addSubview(buildStampLabel)
 
         NSLayoutConstraint.activate([
-            sceneView.leadingAnchor.constraint(equalTo: viewerContent.leadingAnchor),
-            sceneView.trailingAnchor.constraint(equalTo: viewerContent.trailingAnchor),
-            sceneView.topAnchor.constraint(equalTo: viewerContent.topAnchor),
-            sceneView.bottomAnchor.constraint(equalTo: viewerContent.bottomAnchor),
-            viewCube.topAnchor.constraint(equalTo: viewerContent.topAnchor, constant: 16),
-            viewCube.trailingAnchor.constraint(equalTo: viewerContent.trailingAnchor, constant: -16),
-            loadingBar.centerXAnchor.constraint(equalTo: viewerContent.centerXAnchor),
-            loadingBar.centerYAnchor.constraint(equalTo: viewerContent.centerYAnchor, constant: -8),
+            sceneView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            sceneView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            sceneView.topAnchor.constraint(equalTo: topAnchor),
+            sceneView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            viewCube.topAnchor.constraint(equalTo: topAnchor, constant: 16),
+            viewCube.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -16),
+            loadingBar.centerXAnchor.constraint(equalTo: centerXAnchor),
+            loadingBar.centerYAnchor.constraint(equalTo: centerYAnchor, constant: -8),
             loadingBar.widthAnchor.constraint(equalToConstant: 260),
-            loadingLabel.centerXAnchor.constraint(equalTo: viewerContent.centerXAnchor),
-            loadingLabel.topAnchor.constraint(equalTo: loadingBar.bottomAnchor, constant: 10)
+            loadingLabel.centerXAnchor.constraint(equalTo: centerXAnchor),
+            loadingLabel.topAnchor.constraint(equalTo: loadingBar.bottomAnchor, constant: 10),
+            buildStampLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
+            buildStampLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10)
         ])
     }
 
@@ -193,11 +196,11 @@ final class CADViewerSurface: NSGlassEffectView {
         stack.alignment = .leading
         stack.spacing = 6
         resultCard.addSubview(stack)
-        viewerContent.addSubview(resultCard)
+        addSubview(resultCard)
 
         NSLayoutConstraint.activate([
-            resultCard.trailingAnchor.constraint(equalTo: viewerContent.trailingAnchor, constant: -18),
-            resultCard.bottomAnchor.constraint(equalTo: viewerContent.bottomAnchor, constant: -18),
+            resultCard.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -18),
+            resultCard.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -18),
             resultCard.widthAnchor.constraint(greaterThanOrEqualToConstant: 240),
             grid.widthAnchor.constraint(equalTo: stack.widthAnchor),
             stack.leadingAnchor.constraint(equalTo: resultCard.leadingAnchor),
@@ -220,6 +223,10 @@ final class CADViewerSurface: NSGlassEffectView {
 
     @objc private func lengthUnitDidChange(_ notification: Notification) {
         show(lastResult)
+    }
+
+    @objc private func displayOptionsDidChange(_ notification: Notification) {
+        sceneView.applyDisplayOptions(CADPreferences.displayOptions)
     }
 
     private func show(_ result: SmartMeasurementResult?) {

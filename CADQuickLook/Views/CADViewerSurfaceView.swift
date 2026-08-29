@@ -15,3 +15,13 @@ struct CADViewerSurfaceView: NSViewRepresentable {
         view.display(asset)
     }
 }
+
+/// The app window's Liquid Glass background. Mounted once behind every state
+/// of `ContentView` so empty, loading and viewer screens share one backdrop.
+struct CADGlassBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> CADGlassBackdrop {
+        CADGlassBackdrop(host: .appWindow)
+    }
+
+    func updateNSView(_ view: CADGlassBackdrop, context: Context) {}
+}

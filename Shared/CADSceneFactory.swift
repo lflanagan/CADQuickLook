@@ -5,9 +5,13 @@ import simd
 enum CADSceneFactory {
     static let surfaceNodeName = "CADSurface"
     static let edgeNodeName = "CADEdges"
+    static let tangentEdgeNodeName = "CADTangentEdges"
+    /// Depth-ignoring copies of the edge nodes, shown for "hidden edges visible".
+    static let hiddenEdgeNodeName = "CADHiddenEdges"
+    static let hiddenTangentEdgeNodeName = "CADHiddenTangentEdges"
     static let modelNodeName = "CADModel"
 
-    static func makeScene(for asset: CADModelAsset) -> SCNScene {
+    static func makeScene(for asset: CADModelAsset, options: CADDisplayOptions = .default) -> SCNScene {
         let scene = SCNScene()
         scene.background.contents = NSColor.clear
         let modelRoot = SCNNode()
@@ -17,13 +21,43 @@ enum CADSceneFactory {
         if let surface = makeSurfaceNode(asset) {
             modelRoot.addChildNode(surface)
         }
-        if let edges = makeEdgeNode(asset) {
+        for tangent in [false, true] {
+            guard let edges = makeEdgeNode(asset, tangent: tangent) else { continue }
             modelRoot.addChildNode(edges)
+            modelRoot.addChildNode(makeHiddenEdgeNode(from: edges, tangent: tangent))
         }
 
         addLighting(to: scene)
         addCamera(to: scene, asset: asset)
+        apply(options, to: scene)
         return scene
+    }
+
+    /// Applies display options to a scene built by `makeScene`. Only material
+    /// properties and node visibility change; geometry is never rebuilt.
+    static func apply(_ options: CADDisplayOptions, to scene: SCNScene) {
+        guard let modelRoot = scene.rootNode.childNode(withName: modelNodeName, recursively: false) else { return }
+        let showsEdges = options.shading.showsEdges
+        let showsTangent = showsEdges && options.tangentEdges != .removed
+        let showsHidden = showsEdges && options.hiddenEdges == .visible
+        let tangentFade: CGFloat = options.tangentEdges == .phantom ? 0.32 : 1
+
+        if let surface = modelRoot.childNode(withName: surfaceNodeName, recursively: false)?.geometry?.firstMaterial {
+            surface.lightingModel = options.shading == .unshaded ? .constant : .blinn
+            surface.transparency = options.shading == .translucent ? 0.42 : 1
+            surface.transparencyMode = options.shading == .translucent ? .dualLayer : .aOne
+            surface.writesToDepthBuffer = options.shading != .translucent
+        }
+        setEdgeNode(edgeNodeName, in: modelRoot, visible: showsEdges, opacity: 1)
+        setEdgeNode(tangentEdgeNodeName, in: modelRoot, visible: showsTangent, opacity: tangentFade)
+        setEdgeNode(hiddenEdgeNodeName, in: modelRoot, visible: showsHidden, opacity: 1)
+        setEdgeNode(hiddenTangentEdgeNodeName, in: modelRoot, visible: showsHidden && showsTangent, opacity: tangentFade)
+    }
+
+    private static func setEdgeNode(_ name: String, in root: SCNNode, visible: Bool, opacity: CGFloat) {
+        guard let node = root.childNode(withName: name, recursively: false) else { return }
+        node.isHidden = !visible
+        node.opacity = opacity
     }
 
     static func renderThumbnail(for asset: CADModelAsset, size: CGSize, scale: CGFloat = 2) -> NSImage {
@@ -112,14 +146,16 @@ enum CADSceneFactory {
         """
     }
 
-    private static func makeEdgeNode(_ asset: CADModelAsset) -> SCNNode? {
+    /// The sharp (`tangent == false`) or tangent edges of the model as one
+    /// line geometry, or nil when there are none of that kind.
+    private static func makeEdgeNode(_ asset: CADModelAsset, tangent: Bool) -> SCNNode? {
         guard !asset.polylinePoints.isEmpty, !asset.edges.isEmpty else { return nil }
         let points = asset.polylinePoints.map(\.sceneVector)
         let source = SCNGeometrySource(vertices: points)
         // One line element for every edge (see makeSurfaceNode for why).
         var indices: [UInt32] = []
         indices.reserveCapacity(points.count * 2)
-        for edge in asset.edges {
+        for edge in asset.edges where (edge.isTangent != 0) == tangent {
             let first = Int(edge.firstPoint)
             let count = Int(edge.pointCount)
             guard count > 1, first + count <= points.count else { continue }
@@ -128,6 +164,7 @@ enum CADSceneFactory {
                 indices.append(UInt32(first + offset + 1))
             }
         }
+        guard !indices.isEmpty else { return nil }
         let data = indices.withUnsafeBytes { Data($0) }
         let element = SCNGeometryElement(
             data: data,
@@ -148,8 +185,27 @@ enum CADSceneFactory {
         material.shaderModifiers = [.geometry: depthBiasModifier(0.0012)]
         geometry.materials = [material]
         let node = SCNNode(geometry: geometry)
-        node.name = edgeNodeName
+        node.name = tangent ? tangentEdgeNodeName : edgeNodeName
         node.categoryBitMask = 2
+        node.renderingOrder = 10
+        return node
+    }
+
+    /// A copy of an edge node that ignores the depth buffer, drawn faintly
+    /// beneath the real one so edges behind the surface show through.
+    private static func makeHiddenEdgeNode(from edges: SCNNode, tangent: Bool) -> SCNNode {
+        let geometry = edges.geometry!.copy() as! SCNGeometry
+        let material = SCNMaterial()
+        material.diffuse.contents = NSColor(calibratedWhite: 0.12, alpha: 0.28)
+        material.lightingModel = .constant
+        material.readsFromDepthBuffer = false
+        material.writesToDepthBuffer = false
+        geometry.materials = [material]
+        let node = SCNNode(geometry: geometry)
+        node.name = tangent ? hiddenTangentEdgeNodeName : hiddenEdgeNodeName
+        node.categoryBitMask = 2
+        node.renderingOrder = 5
+        node.isHidden = true
         return node
     }
 

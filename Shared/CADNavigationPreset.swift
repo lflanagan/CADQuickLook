@@ -89,9 +89,65 @@ enum CADLengthUnit: String, CaseIterable, Identifiable {
     }
 }
 
+/// One choice in a display-option submenu (shading, hidden edges, tangent edges).
+protocol CADDisplayMode: RawRepresentable<String>, CaseIterable, Hashable {
+    var title: String { get }
+}
+
+enum CADShadingMode: String, CaseIterable, Identifiable, CADDisplayMode {
+    case shadedWithEdges, shadedWithoutEdges, unshaded, translucent
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .shadedWithEdges: "Shaded with edges"
+        case .shadedWithoutEdges: "Shaded without edges"
+        case .unshaded: "Unshaded"
+        case .translucent: "Translucent"
+        }
+    }
+
+    var showsEdges: Bool { self != .shadedWithoutEdges }
+}
+
+enum CADHiddenEdgeMode: String, CaseIterable, Identifiable, CADDisplayMode {
+    case visible, removed
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .visible: "Hidden edges visible"
+        case .removed: "Hidden edges removed"
+        }
+    }
+}
+
+enum CADTangentEdgeMode: String, CaseIterable, Identifiable, CADDisplayMode {
+    case visible, phantom, removed
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .visible: "Tangent edges visible"
+        case .phantom: "Tangent edges phantom"
+        case .removed: "Tangent edges removed"
+        }
+    }
+}
+
+/// How the model is drawn; see `CADSceneFactory.apply(_:to:)`.
+struct CADDisplayOptions: Equatable {
+    var shading: CADShadingMode = .shadedWithEdges
+    var hiddenEdges: CADHiddenEdgeMode = .removed
+    var tangentEdges: CADTangentEdgeMode = .visible
+
+    static let `default` = CADDisplayOptions()
+}
+
 extension Notification.Name {
     static let cadCameraProjectionDidChange = Notification.Name("cadCameraProjectionDidChange")
     static let cadLengthUnitDidChange = Notification.Name("cadLengthUnitDidChange")
+    static let cadDisplayOptionsDidChange = Notification.Name("cadDisplayOptionsDidChange")
 }
 
 enum CADPreferences {
@@ -99,6 +155,9 @@ enum CADPreferences {
     static let navigationPresetKey = "navigationPreset"
     static let cameraProjectionKey = "cameraProjection"
     static let lengthUnitKey = "lengthUnit"
+    static let shadingModeKey = "shadingMode"
+    static let hiddenEdgeModeKey = "hiddenEdgeMode"
+    static let tangentEdgeModeKey = "tangentEdgeMode"
 
     /// App Group shared by the app and both Quick Look extensions. The
     /// identifier is expanded into Info.plist from the signing team at build
@@ -140,6 +199,21 @@ enum CADPreferences {
     static func setLengthUnit(_ unit: CADLengthUnit) {
         defaults.set(unit.rawValue, forKey: lengthUnitKey)
         NotificationCenter.default.post(name: .cadLengthUnitDidChange, object: unit)
+    }
+
+    static var displayOptions: CADDisplayOptions {
+        CADDisplayOptions(
+            shading: rawValue(forKey: shadingModeKey).flatMap(CADShadingMode.init(rawValue:)) ?? .shadedWithEdges,
+            hiddenEdges: rawValue(forKey: hiddenEdgeModeKey).flatMap(CADHiddenEdgeMode.init(rawValue:)) ?? .removed,
+            tangentEdges: rawValue(forKey: tangentEdgeModeKey).flatMap(CADTangentEdgeMode.init(rawValue:)) ?? .visible
+        )
+    }
+
+    static func setDisplayOptions(_ options: CADDisplayOptions) {
+        defaults.set(options.shading.rawValue, forKey: shadingModeKey)
+        defaults.set(options.hiddenEdges.rawValue, forKey: hiddenEdgeModeKey)
+        defaults.set(options.tangentEdges.rawValue, forKey: tangentEdgeModeKey)
+        NotificationCenter.default.post(name: .cadDisplayOptionsDidChange, object: nil)
     }
 
     /// Group value first; falls back to the pre-App-Group per-process value.

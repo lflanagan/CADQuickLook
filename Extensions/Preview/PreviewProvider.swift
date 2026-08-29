@@ -2,11 +2,14 @@ import AppKit
 @preconcurrency import QuickLookUI
 
 final class PreviewProvider: NSViewController, @MainActor QLPreviewingController {
+    private let backdrop = CADGlassBackdrop(host: .previewPanel)
     private let viewer = CADViewerSurface()
 
     override func loadView() {
-        viewer.frame = NSRect(x: 0, y: 0, width: 960, height: 720)
-        view = viewer
+        backdrop.frame = NSRect(x: 0, y: 0, width: 960, height: 720)
+        backdrop.contentView = viewer
+        viewer.showsBuildStamp = true
+        view = backdrop
     }
 
     func preparePreviewOfFile(at url: URL) async throws {
