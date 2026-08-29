@@ -27,14 +27,38 @@ typedef struct CADMeshOptions {
     /// Maximum chordal deviation in the model's units. Values <= 0 use an
     /// automatic value derived from the bounding-box diagonal.
     double linearDeflection;
-    /// Maximum angular deviation in radians. Values <= 0 default to 0.35.
+    /// Maximum angular deviation in radians. Values <= 0 default to 0.15.
     double angularDeflectionRadians;
     /// Deflection used to sample exact topological edges. Values <= 0 use the
     /// mesh linear deflection.
     double edgeDeflection;
     /// Ask OCCT to mesh in parallel (0 or 1).
     uint8_t parallel;
+    /// Multiplier applied to the automatic linear deflection (values <= 0
+    /// mean 1). Thumbnails use a coarser mesh to load faster.
+    double linearDeflectionScale;
+    /// Run Open CASCADE's shape-healing pass during STEP translation (0 or 1).
+    /// Healing costs ~25% of load time on large assemblies and is rarely
+    /// needed for files from modern exporters.
+    uint8_t healShapes;
 } CADMeshOptions;
+
+typedef enum CADLoadStage {
+    CADLoadStageReading = 0,
+    CADLoadStageTranslating = 1,
+    CADLoadStageMeshing = 2,
+    CADLoadStageBuildingMesh = 3,
+    CADLoadStageSamplingEdges = 4,
+    CADLoadStageFinishing = 5
+} CADLoadStage;
+
+/// Progress callback. `fraction` is 0...1, or a negative value when the stage
+/// has no measurable progress. `count` is the number of items in the stage
+/// (faces, edges) when known, else 0. May be invoked from worker threads.
+typedef void (*CADBridgeProgressCallback)(void *context, CADLoadStage stage, double fraction, uint32_t count);
+
+/// Installs a progress callback for subsequent loads. Pass NULL to clear.
+void CADBridgeModelSetProgressCallback(CADBridgeModel *model, CADBridgeProgressCallback callback, void *context);
 
 typedef struct CADVertex {
     float x, y, z;
@@ -52,7 +76,8 @@ typedef struct CADTriangle {
 typedef struct CADFaceRange {
     uint32_t firstTriangle;
     uint32_t triangleCount;
-    /// Exact OCCT B-Rep surface area in squared model units.
+    /// Exact OCCT B-Rep surface area in squared model units, or -1 until
+    /// CADBridgeModelFaceArea() computes it on demand.
     double exactArea;
 } CADFaceRange;
 
@@ -64,7 +89,8 @@ typedef struct CADPoint3D {
 typedef struct CADEdgePolyline {
     uint32_t firstPoint;
     uint32_t pointCount;
-    /// Exact OCCT curve length in model units (not the polyline length).
+    /// Exact OCCT curve length in model units (not the polyline length), or
+    /// -1 until CADBridgeModelEdgeLength() computes it on demand.
     double exactLength;
     /// 1 when the underlying exact OCCT curve is a circle or circular arc.
     uint8_t isCircular;
@@ -97,7 +123,7 @@ typedef struct CADFaceDistance {
 } CADFaceDistance;
 
 /// Sensible interactive-view defaults. The linear and edge deflections are
-/// automatic (0); angular deflection is 0.35 radians; parallel is enabled.
+/// automatic (0); angular deflection is 0.15 radians; parallel is enabled.
 CADMeshOptions CADBridgeDefaultMeshOptions(void);
 
 CADBridgeModel *CADBridgeModelCreate(void);
@@ -129,6 +155,12 @@ size_t CADBridgeModelEdgeCount(const CADBridgeModel *model);
 
 CADBounds CADBridgeModelBounds(const CADBridgeModel *model);
 CADModelStats CADBridgeModelStats(const CADBridgeModel *model);
+
+/// Exact surface area of a face (zero-based index), computed lazily and cached.
+CADBridgeStatus CADBridgeModelFaceArea(CADBridgeModel *model, uint32_t faceIndex, double *outArea);
+
+/// Exact curve length of an edge (zero-based index), computed lazily and cached.
+CADBridgeStatus CADBridgeModelEdgeLength(CADBridgeModel *model, uint32_t edgeIndex, double *outLength);
 
 /// Computes the exact minimum distance between two B-Rep faces. Face indices
 /// are zero-based and correspond to CADTriangle.faceIndex/CADFaceRange.

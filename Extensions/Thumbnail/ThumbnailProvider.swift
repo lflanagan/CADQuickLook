@@ -7,7 +7,7 @@ final class ThumbnailProvider: QLThumbnailProvider {
         _ handler: @escaping (QLThumbnailReply?, (any Error)?) -> Void
     ) {
         do {
-            let asset = try CADModelAsset(url: request.fileURL)
+            let asset = try CADModelAsset(url: request.fileURL, quality: .thumbnail)
             let image = CADSceneFactory.renderThumbnail(
                 for: asset,
                 size: request.maximumSize,
@@ -17,12 +17,14 @@ final class ThumbnailProvider: QLThumbnailProvider {
             guard let cgImage = image.cgImage(forProposedRect: &proposed, context: nil, hints: nil) else {
                 throw CADModelError.loadFailed("Could not render the CAD thumbnail.")
             }
-            let size = request.maximumSize
-            let reply = QLThumbnailReply(contextSize: size) { context in
+            let reply = QLThumbnailReply(contextSize: request.maximumSize) { context in
+                // The context's user space is not guaranteed to be in points;
+                // the clip covers exactly the full thumbnail, so paint that.
+                let rect = context.boundingBoxOfClipPath
                 context.setFillColor(NSColor(calibratedWhite: 0.10, alpha: 1).cgColor)
-                context.fill(CGRect(origin: .zero, size: size))
+                context.fill(rect)
                 context.interpolationQuality = .high
-                context.draw(cgImage, in: CGRect(origin: .zero, size: size))
+                context.draw(cgImage, in: rect)
                 return true
             }
             handler(reply, nil)
