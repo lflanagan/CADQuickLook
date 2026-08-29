@@ -5,12 +5,13 @@ import simd
 enum CADSceneFactory {
     static let surfaceNodeName = "CADSurface"
     static let edgeNodeName = "CADEdges"
+    static let modelNodeName = "CADModel"
 
     static func makeScene(for asset: CADModelAsset) -> SCNScene {
         let scene = SCNScene()
         scene.background.contents = NSColor.clear
         let modelRoot = SCNNode()
-        modelRoot.name = "CADModel"
+        modelRoot.name = modelNodeName
         scene.rootNode.addChildNode(modelRoot)
 
         if let surface = makeSurfaceNode(asset) {
@@ -19,7 +20,6 @@ enum CADSceneFactory {
         if let edges = makeEdgeNode(asset) {
             modelRoot.addChildNode(edges)
         }
-        modelRoot.addChildNode(makeOriginNode(for: asset))
 
         addLighting(to: scene)
         addCamera(to: scene, asset: asset)
@@ -42,58 +42,19 @@ enum CADSceneFactory {
     private static func makeSurfaceNode(_ asset: CADModelAsset) -> SCNNode? {
         guard !asset.vertices.isEmpty, !asset.triangles.isEmpty else { return nil }
 
-        let vertexData = asset.vertices.withUnsafeBytes { Data($0) }
-        let stride = MemoryLayout<CADVertex>.stride
-        let positions = SCNGeometrySource(
-            data: vertexData,
-            semantic: .vertex,
-            vectorCount: asset.vertices.count,
-            usesFloatComponents: true,
-            componentsPerVector: 3,
-            bytesPerComponent: MemoryLayout<Float>.size,
-            dataOffset: 0,
-            dataStride: stride
-        )
-        let normals = SCNGeometrySource(
-            data: vertexData,
-            semantic: .normal,
-            vectorCount: asset.vertices.count,
-            usesFloatComponents: true,
-            componentsPerVector: 3,
-            bytesPerComponent: MemoryLayout<Float>.size,
-            dataOffset: MemoryLayout<Float>.size * 3,
-            dataStride: stride
-        )
-
-        let elements: [SCNGeometryElement] = asset.faceRanges.map { range in
-            let first = Int(range.firstTriangle)
-            let count = Int(range.triangleCount)
-            var indices: [UInt32] = []
-            indices.reserveCapacity(count * 3)
-            if count > 0, first + count <= asset.triangles.count {
-                for triangle in asset.triangles[first..<(first + count)] {
-                    indices.append(triangle.i0)
-                    indices.append(triangle.i1)
-                    indices.append(triangle.i2)
-                }
-            }
-            let data = indices.withUnsafeBytes { Data($0) }
-            return SCNGeometryElement(
-                data: data,
-                primitiveType: .triangles,
-                primitiveCount: count,
-                bytesPerIndex: MemoryLayout<UInt32>.size
-            )
-        }
-
-        let geometry = SCNGeometry(sources: [positions, normals], elements: elements)
+        // A single element for every triangle. SceneKit degrades badly past a
+        // few thousand elements per geometry (garbage materials, render-thread
+        // crashes), and STEP assemblies easily have 10k+ faces. Triangles are
+        // stored face-by-face, so a hit's primitive index maps back to its
+        // face through CADTriangle.faceIndex.
+        let geometry = SCNGeometry(sources: asset.surfaceGeometrySources, elements: [makeTriangleElement(asset.triangles)])
         let material = SCNMaterial()
         material.name = "Machined aluminum"
         material.diffuse.contents = NSColor(calibratedRed: 0.52, green: 0.66, blue: 0.76, alpha: 1)
         material.metalness.contents = 0.35
         material.roughness.contents = 0.42
         material.isDoubleSided = true
-        geometry.materials = Array(repeating: material, count: max(elements.count, 1))
+        geometry.materials = [material]
 
         let node = SCNNode(geometry: geometry)
         node.name = surfaceNodeName
@@ -101,38 +62,91 @@ enum CADSceneFactory {
         return node
     }
 
+    private static func makeTriangleElement<C: Collection>(_ triangles: C) -> SCNGeometryElement where C.Element == CADTriangle {
+        var indices: [UInt32] = []
+        indices.reserveCapacity(triangles.count * 3)
+        for triangle in triangles {
+            indices.append(triangle.i0)
+            indices.append(triangle.i1)
+            indices.append(triangle.i2)
+        }
+        let data = indices.withUnsafeBytes { Data($0) }
+        return SCNGeometryElement(
+            data: data,
+            primitiveType: .triangles,
+            primitiveCount: triangles.count,
+            bytesPerIndex: MemoryLayout<UInt32>.size
+        )
+    }
+
+    /// Geometry containing only `faceIndex`'s triangles, drawn slightly in
+    /// front of the surface so it reads as a highlight over that face.
+    static func makeFaceHighlightGeometry(for asset: CADModelAsset, faceIndex: Int) -> SCNGeometry? {
+        guard asset.faceRanges.indices.contains(faceIndex) else { return nil }
+        let range = asset.faceRanges[faceIndex]
+        let first = Int(range.firstTriangle)
+        let count = Int(range.triangleCount)
+        guard count > 0, first + count <= asset.triangles.count else { return nil }
+
+        let element = makeTriangleElement(asset.triangles[first..<(first + count)])
+        let geometry = SCNGeometry(sources: asset.surfaceGeometrySources, elements: [element])
+        let material = SCNMaterial()
+        material.diffuse.contents = NSColor.systemOrange
+        material.emission.contents = NSColor.systemOrange.withAlphaComponent(0.35)
+        material.metalness.contents = 0.15
+        material.roughness.contents = 0.28
+        material.isDoubleSided = true
+        material.shaderModifiers = [.geometry: depthBiasModifier(0.002)]
+        geometry.materials = [material]
+        return geometry
+    }
+
+    /// Nudges every vertex a fraction of its depth toward the camera so
+    /// coplanar overlays (edge lines, face highlights) win the depth test.
+    static func depthBiasModifier(_ amount: Float) -> String {
+        """
+        #pragma body
+        float4 viewPosition = scn_node.modelViewTransform * _geometry.position;
+        viewPosition.z += \(amount) * abs(viewPosition.z);
+        _geometry.position = scn_node.inverseModelViewTransform * viewPosition;
+        """
+    }
+
     private static func makeEdgeNode(_ asset: CADModelAsset) -> SCNNode? {
         guard !asset.polylinePoints.isEmpty, !asset.edges.isEmpty else { return nil }
         let points = asset.polylinePoints.map(\.sceneVector)
         let source = SCNGeometrySource(vertices: points)
-        var elements: [SCNGeometryElement] = []
-        elements.reserveCapacity(asset.edges.count)
-
+        // One line element for every edge (see makeSurfaceNode for why).
+        var indices: [UInt32] = []
+        indices.reserveCapacity(points.count * 2)
         for edge in asset.edges {
             let first = Int(edge.firstPoint)
             let count = Int(edge.pointCount)
-            var indices: [UInt32] = []
-            if count > 1, first + count <= points.count {
-                indices.reserveCapacity((count - 1) * 2)
-                for offset in 0..<(count - 1) {
-                    indices.append(UInt32(first + offset))
-                    indices.append(UInt32(first + offset + 1))
-                }
+            guard count > 1, first + count <= points.count else { continue }
+            for offset in 0..<(count - 1) {
+                indices.append(UInt32(first + offset))
+                indices.append(UInt32(first + offset + 1))
             }
-            let data = indices.withUnsafeBytes { Data($0) }
-            elements.append(SCNGeometryElement(
-                data: data,
-                primitiveType: .line,
-                primitiveCount: max(0, count - 1),
-                bytesPerIndex: MemoryLayout<UInt32>.size
-            ))
         }
+        let data = indices.withUnsafeBytes { Data($0) }
+        let element = SCNGeometryElement(
+            data: data,
+            primitiveType: .line,
+            primitiveCount: indices.count / 2,
+            bytesPerIndex: MemoryLayout<UInt32>.size
+        )
 
-        let geometry = SCNGeometry(sources: [source], elements: elements)
+        let geometry = SCNGeometry(sources: [source], elements: [element])
         let material = SCNMaterial()
-        material.diffuse.contents = NSColor(calibratedWhite: 0.12, alpha: 0.9)
+        // Drawings have no faces behind the lines, so draw them light on the dark background.
+        material.diffuse.contents = asset.isPlanar
+            ? NSColor(calibratedWhite: 0.88, alpha: 1)
+            : NSColor(calibratedWhite: 0.12, alpha: 0.9)
         material.lightingModel = .constant
-        geometry.materials = Array(repeating: material, count: max(elements.count, 1))
+        // Edge polylines lie exactly on the faces they bound, so without a
+        // depth bias they z-fight and render as broken, stippled lines.
+        material.shaderModifiers = [.geometry: depthBiasModifier(0.0012)]
+        geometry.materials = [material]
         let node = SCNNode(geometry: geometry)
         node.name = edgeNodeName
         node.categoryBitMask = 2
@@ -162,109 +176,10 @@ enum CADSceneFactory {
         scene.rootNode.addChildNode(ambient)
     }
 
-    private static func makeOriginNode(for asset: CADModelAsset) -> SCNNode {
-        let root = SCNNode()
-        root.name = "CADOrigin"
-        root.categoryBitMask = 4
-
-        let pivot = orbitPivot(for: asset)
-        let modelRadius = fittingRadius(for: asset, around: pivot)
-        let axisLength = max(modelRadius * 0.22, 0.5)
-        let axisRadius = max(axisLength * 0.018, 0.012)
-
-        let originMaterial = SCNMaterial()
-        originMaterial.diffuse.contents = NSColor(calibratedWhite: 0.94, alpha: 1)
-        originMaterial.emission.contents = NSColor(calibratedWhite: 0.30, alpha: 1)
-        originMaterial.lightingModel = .constant
-        originMaterial.readsFromDepthBuffer = false
-        originMaterial.writesToDepthBuffer = false
-        let marker = SCNSphere(radius: axisRadius * 1.7)
-        marker.segmentCount = 16
-        marker.materials = [originMaterial]
-        let markerNode = SCNNode(geometry: marker)
-        markerNode.renderingOrder = 100
-        root.addChildNode(markerNode)
-
-        addOriginAxis(
-            label: "X",
-            direction: SIMD3<Float>(1, 0, 0),
-            length: axisLength,
-            radius: axisRadius,
-            color: .systemRed,
-            to: root
-        )
-        addOriginAxis(
-            label: "Y",
-            direction: SIMD3<Float>(0, 1, 0),
-            length: axisLength,
-            radius: axisRadius,
-            color: .systemGreen,
-            to: root
-        )
-        addOriginAxis(
-            label: "Z",
-            direction: SIMD3<Float>(0, 0, 1),
-            length: axisLength,
-            radius: axisRadius,
-            color: .systemBlue,
-            to: root
-        )
-        return root
-    }
-
-    private static func addOriginAxis(
-        label: String,
-        direction: SIMD3<Float>,
-        length: CGFloat,
-        radius: CGFloat,
-        color: NSColor,
-        to root: SCNNode
-    ) {
-        let material = SCNMaterial()
-        material.diffuse.contents = color
-        material.emission.contents = color
-        material.lightingModel = .constant
-        material.readsFromDepthBuffer = false
-        material.writesToDepthBuffer = false
-
-        let cylinder = SCNCylinder(radius: radius, height: length)
-        cylinder.radialSegmentCount = 8
-        cylinder.materials = [material]
-        let line = SCNNode(geometry: cylinder)
-        line.simdPosition = direction * Float(length * 0.5)
-        line.simdOrientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: direction)
-        line.categoryBitMask = 4
-        line.renderingOrder = 100
-        root.addChildNode(line)
-
-        let text = SCNText(string: label, extrusionDepth: radius * 0.12)
-        text.font = .systemFont(ofSize: 1, weight: .bold)
-        text.flatness = 0.08
-        text.materials = [material]
-        let textNode = SCNNode(geometry: text)
-        textNode.simdPosition = direction * Float(length * 1.13)
-        let labelScale = axisLengthLabelScale(length)
-        textNode.scale = SCNVector3(labelScale, labelScale, labelScale)
-        let bounds = textNode.boundingBox
-        textNode.pivot = SCNMatrix4MakeTranslation(
-            (bounds.min.x + bounds.max.x) * 0.5,
-            (bounds.min.y + bounds.max.y) * 0.5,
-            0
-        )
-        let billboard = SCNBillboardConstraint()
-        billboard.freeAxes = .all
-        textNode.constraints = [billboard]
-        textNode.categoryBitMask = 4
-        textNode.renderingOrder = 101
-        root.addChildNode(textNode)
-    }
-
-    private static func axisLengthLabelScale(_ axisLength: CGFloat) -> CGFloat {
-        axisLength * 0.22
-    }
-
     static func orbitPivot(for asset: CADModelAsset) -> SCNVector3 {
-        guard asset.stats.solidCount > 1 || asset.stats.shellCount > 1 else { return SCNVector3Zero }
+        // Drawings and multi-body assemblies frame on their bounding box;
+        // single parts frame on their origin so the datum stays centred.
+        guard asset.isPlanar || asset.stats.solidCount > 1 || asset.stats.shellCount > 1 else { return SCNVector3Zero }
         let minimum = asset.bounds.minimum.sceneVector
         let maximum = asset.bounds.maximum.sceneVector
         return SCNVector3(
@@ -283,9 +198,40 @@ enum CADSceneFactory {
         return max(sqrt(xExtent * xExtent + yExtent * yExtent + zExtent * zExtent), 1)
     }
 
+    /// Distance from the fitting sphere's centre to the camera, in radii.
+    static let fittingDistanceFactor: Float = 3.4
+
+    /// Default front-right-top view: camera at +X, -Y, +Z looking at the model.
+    static let defaultCameraOffset = simd_normalize(SIMD3<Float>(1.25, -0.9, 1.45))
+
+    /// Orientation for a camera sitting at `offset` from its target, with the
+    /// world `up` direction kept vertical on screen. CAD models are Z-up.
+    static func cameraOrientation(offset: SIMD3<Float>, up: SIMD3<Float> = SIMD3<Float>(0, 0, 1)) -> simd_quatf {
+        let backward = simd_normalize(offset)
+        var right = simd_cross(up, backward)
+        if simd_length(right) < 1e-5 {
+            right = simd_cross(SIMD3<Float>(0, 1, 0), backward)
+        }
+        right = simd_normalize(right)
+        let trueUp = simd_cross(backward, right)
+        return simd_normalize(simd_quatf(simd_float3x3(columns: (right, trueUp, backward))))
+    }
+
+    static func cameraOrientation(for view: CADStandardView) -> simd_quatf {
+        switch view {
+        case .isometric: cameraOrientation(offset: SIMD3<Float>(1, -1, 1))
+        case .top: cameraOrientation(offset: SIMD3<Float>(0, 0, 1), up: SIMD3<Float>(0, 1, 0))
+        case .bottom: cameraOrientation(offset: SIMD3<Float>(0, 0, -1), up: SIMD3<Float>(0, -1, 0))
+        case .front: cameraOrientation(offset: SIMD3<Float>(0, -1, 0))
+        case .back: cameraOrientation(offset: SIMD3<Float>(0, 1, 0))
+        case .left: cameraOrientation(offset: SIMD3<Float>(-1, 0, 0))
+        case .right: cameraOrientation(offset: SIMD3<Float>(1, 0, 0))
+        }
+    }
+
     private static func addCamera(to scene: SCNScene, asset: CADModelAsset) {
         let pivot = orbitPivot(for: asset)
-        let fittingRadius = fittingRadius(for: asset, around: pivot)
+        let fittingRadius = Float(fittingRadius(for: asset, around: pivot))
 
         let target = SCNNode()
         target.name = "CameraTarget"
@@ -297,17 +243,15 @@ enum CADSceneFactory {
         camera.camera = SCNCamera()
         camera.camera?.fieldOfView = 38
         camera.camera?.automaticallyAdjustsZRange = true
-        let direction = SCNVector3(1.25, -0.9, 1.45)
-        let directionLength = sqrt(direction.x * direction.x + direction.y * direction.y + direction.z * direction.z)
-        let distance = fittingRadius * 3.4
-        camera.position = SCNVector3(
-            pivot.x + direction.x / directionLength * distance,
-            pivot.y + direction.y / directionLength * distance,
-            pivot.z + direction.z / directionLength * distance
-        )
-        let lookAt = SCNLookAtConstraint(target: target)
-        lookAt.isGimbalLockEnabled = true
-        camera.constraints = [lookAt]
+        let distance = fittingRadius * fittingDistanceFactor
+        let offset = asset.isPlanar ? SIMD3<Float>(0, 0, 1) : defaultCameraOffset
+        camera.simdPosition = target.simdPosition + offset * distance
+        camera.simdOrientation = asset.isPlanar ? cameraOrientation(for: .top) : cameraOrientation(offset: defaultCameraOffset)
+        if asset.isPlanar || CADPreferences.cameraProjection == .orthographic, let cameraGeometry = camera.camera {
+            let fieldOfViewRadians = Float(cameraGeometry.fieldOfView) * .pi / 180
+            cameraGeometry.usesOrthographicProjection = true
+            cameraGeometry.orthographicScale = Double(distance * tan(fieldOfViewRadians * 0.5))
+        }
         scene.rootNode.addChildNode(camera)
     }
 }

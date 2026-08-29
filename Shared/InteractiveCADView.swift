@@ -4,22 +4,30 @@ import simd
 
 @MainActor
 final class InteractiveCADView: SCNView {
-    var asset: CADModelAsset?
+    var asset: CADModelAsset? {
+        didSet {
+            axisProbeLength = asset.map {
+                max(Float(CADSceneFactory.fittingRadius(for: $0, around: CADSceneFactory.orbitPivot(for: $0))) * 0.02, 1e-3)
+            } ?? 1
+        }
+    }
     var onHover: ((SmartSelectionTarget?) -> Void)?
     var onSelect: ((SmartSelectionTarget) -> Void)?
-    var onViewDirectionChanged: ((SCNVector3) -> Void)? {
-        didSet { publishViewDirection() }
+    var onCameraOrientationChanged: ((simd_quatf) -> Void)? {
+        didSet { publishCameraOrientation() }
     }
 
     private var trackingAreaReference: NSTrackingArea?
     private var currentHover: SmartSelectionTarget?
-    private var highlightedFace: Int?
-    private var highlightedEdge: Int?
+    private var faceHighlightNode: SCNNode?
     private var highlightedEdgePoints: [SCNVector3] = []
+    private var highlightedVertex: SCNVector3?
     private var measurementPoints: [SCNVector3] = []
-    private var surfaceBaseMaterial: SCNMaterial?
-    private var edgeBaseMaterial: SCNMaterial?
-    private var onshapeOrbitPivot: SCNVector3?
+    /// Every rotation is about the part's origin (world 0,0,0), wherever the
+    /// drag starts — the model swings around its own datum, Onshape-style.
+    private let orbitPivot = SIMD3<Float>.zero
+    private var cameraAnimation: Timer?
+    private var axisProbeLength: Float = 1
     private lazy var vectorOverlay: CADVectorOverlayView = {
         let overlay = CADVectorOverlayView(frame: bounds)
         overlay.autoresizingMask = [.width, .height]
@@ -28,6 +36,10 @@ final class InteractiveCADView: SCNView {
     }()
 
     override var acceptsFirstResponder: Bool { true }
+
+    isolated deinit {
+        cameraAnimation?.invalidate()
+    }
 
     override func layout() {
         super.layout()
@@ -47,6 +59,8 @@ final class InteractiveCADView: SCNView {
         trackingAreaReference = area
     }
 
+    // MARK: - Mouse
+
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         setHover(target(at: point))
@@ -57,8 +71,9 @@ final class InteractiveCADView: SCNView {
     }
 
     override func mouseDown(with event: NSEvent) {
-        if navigationPreset == .catia, NSEvent.pressedMouseButtons & (1 << 2) != 0 { return }
         window?.makeFirstResponder(self)
+        // CATIA: middle + left drag rotates, so a left press during a middle drag is not a pick.
+        if navigationPreset == .catia, NSEvent.pressedMouseButtons & (1 << 2) != 0 { return }
         let point = convert(event.locationInWindow, from: nil)
         if let target = target(at: point) {
             setHover(target)
@@ -66,19 +81,15 @@ final class InteractiveCADView: SCNView {
         }
     }
 
-    override func rightMouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(self)
-        guard navigationPreset == .onshape,
-              !event.modifierFlags.contains(.control) else {
-            onshapeOrbitPivot = nil
-            return
-        }
-        let point = convert(event.locationInWindow, from: nil)
-        onshapeOrbitPivot = target(at: point)?.position ?? asset.map(CADSceneFactory.orbitPivot)
+    override func mouseDragged(with event: NSEvent) {
+        // With both buttons held AppKit reports left-button drags, so CATIA's
+        // middle + left rotate arrives here rather than in otherMouseDragged.
+        guard navigationPreset == .catia, NSEvent.pressedMouseButtons & (1 << 2) != 0 else { return }
+        orbit(deltaX: event.deltaX, deltaY: event.deltaY)
     }
 
-    override func rightMouseUp(with event: NSEvent) {
-        onshapeOrbitPivot = nil
+    override func rightMouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
     }
 
     override func rightMouseDragged(with event: NSEvent) {
@@ -86,7 +97,7 @@ final class InteractiveCADView: SCNView {
         if event.modifierFlags.contains(.control) {
             pan(deltaX: event.deltaX, deltaY: event.deltaY)
         } else {
-            onshapeOrbit(deltaX: event.deltaX, deltaY: event.deltaY)
+            orbit(deltaX: event.deltaX, deltaY: event.deltaY)
         }
     }
 
@@ -111,7 +122,8 @@ final class InteractiveCADView: SCNView {
                 pan(deltaX: event.deltaX, deltaY: event.deltaY)
             } else if event.modifierFlags.contains(.control) {
                 if navigationPreset == .creo, abs(event.deltaX) > abs(event.deltaY) {
-                    orbit(yaw: -event.deltaX * 0.008, pitch: 0)
+                    // Creo "turn": spin about the axis pointing out of the screen.
+                    rotateCamera(yaw: 0, pitch: 0, roll: Float(-event.deltaX * 0.008))
                 } else {
                     dragZoom(deltaY: event.deltaY)
                 }
@@ -131,15 +143,19 @@ final class InteractiveCADView: SCNView {
 
     override func scrollWheel(with event: NSEvent) {
         let sensitivity: CGFloat = event.hasPreciseScrollingDeltas ? 0.012 : 0.10
-        zoom(by: exp(-event.scrollingDeltaY * sensitivity))
+        let point = convert(event.locationInWindow, from: nil)
+        zoom(by: exp(-event.scrollingDeltaY * sensitivity), toward: point)
     }
 
     override func magnify(with event: NSEvent) {
-        zoom(by: max(0.2, 1 - event.magnification))
+        let point = convert(event.locationInWindow, from: nil)
+        zoom(by: max(0.2, 1 - event.magnification), toward: point)
     }
 
+    // MARK: - Keyboard
+
     override func keyDown(with event: NSEvent) {
-        let step: CGFloat
+        let step: Float
         if event.modifierFlags.contains(.shift) {
             step = .pi / 2
         } else if event.modifierFlags.contains(.control) {
@@ -159,11 +175,33 @@ final class InteractiveCADView: SCNView {
             return
         }
 
+        if event.modifierFlags.contains(.option) {
+            switch event.keyCode {
+            case 123: rotateCamera(yaw: 0, pitch: 0, roll: step)
+            case 124: rotateCamera(yaw: 0, pitch: 0, roll: -step)
+            default: super.keyDown(with: event)
+            }
+            return
+        }
+
+        if isPlanar {
+            switch event.keyCode {
+            case 123: pan(deltaX: -30, deltaY: 0)
+            case 124: pan(deltaX: 30, deltaY: 0)
+            case 125: pan(deltaX: 0, deltaY: 30)
+            case 126: pan(deltaX: 0, deltaY: -30)
+            case _ where event.charactersIgnoringModifiers?.lowercased() == "f": fitView()
+            default: super.keyDown(with: event)
+            }
+            return
+        }
+
+        // Arrow keys turn the model the way the arrow points, about the screen axes.
         switch event.keyCode {
-        case 123: orbit(yaw: -step, pitch: 0)
-        case 124: orbit(yaw: step, pitch: 0)
-        case 125: orbit(yaw: 0, pitch: -step)
-        case 126: orbit(yaw: 0, pitch: step)
+        case 123: rotateCamera(yaw: step, pitch: 0, roll: 0)
+        case 124: rotateCamera(yaw: -step, pitch: 0, roll: 0)
+        case 125: rotateCamera(yaw: 0, pitch: -step, roll: 0)
+        case 126: rotateCamera(yaw: 0, pitch: step, roll: 0)
         default:
             switch event.charactersIgnoringModifiers?.lowercased() {
             case "f": fitView()
@@ -173,6 +211,8 @@ final class InteractiveCADView: SCNView {
         }
     }
 
+    // MARK: - Public camera API
+
     func updateMeasurementOverlay(_ result: SmartMeasurementResult?) {
         measurementPoints = result?.points ?? []
         refreshVectorOverlay()
@@ -180,127 +220,154 @@ final class InteractiveCADView: SCNView {
 
     func setCameraProjection(_ projection: CADCameraProjection) {
         guard let cameraNode, let camera = cameraNode.camera, let targetNode else { return }
-        let offset = subtract(cameraNode.position, targetNode.position)
-        let distance = max(length(offset), 0.001)
-        let fieldOfViewRadians = CGFloat(camera.fieldOfView) * .pi / 180
+        let offset = cameraNode.simdPosition - targetNode.simdPosition
+        let distance = max(simd_length(offset), 0.001)
+        let fieldOfViewRadians = Float(camera.fieldOfView) * .pi / 180
 
         switch projection {
         case .orthographic where !camera.usesOrthographicProjection:
-            camera.orthographicScale = 2 * distance * tan(fieldOfViewRadians * 0.5)
+            camera.orthographicScale = Double(distance * tan(fieldOfViewRadians * 0.5))
             camera.usesOrthographicProjection = true
         case .perspective where camera.usesOrthographicProjection:
-            let matchingDistance = CGFloat(camera.orthographicScale) / (2 * tan(fieldOfViewRadians * 0.5))
-            cameraNode.position = add(
-                targetNode.position,
-                multiply(normalized(offset), max(matchingDistance, 0.001))
-            )
+            let matchingDistance = Float(camera.orthographicScale) / tan(fieldOfViewRadians * 0.5)
+            cameraNode.simdPosition = targetNode.simdPosition
+                + simd_normalize(offset) * max(matchingDistance, 0.001)
             camera.usesOrthographicProjection = false
         default:
             break
         }
 
-        refreshVectorOverlay()
-        setNeedsDisplay(bounds)
+        cameraDidMove()
     }
 
-    private func target(at screenPoint: CGPoint) -> SmartSelectionTarget? {
-        let hits = hitTest(screenPoint, options: [
-            .categoryBitMask: 1,
-            .searchMode: SCNHitTestSearchMode.all.rawValue,
-            .ignoreHiddenNodes: false,
-            .boundingBoxOnly: false
-        ])
-        let faceHit = hits.first
-        let visibleDepth = faceHit.map { projectPoint($0.worldCoordinates).z }
-        if let edge = nearestEdge(to: screenPoint, noFartherThan: visibleDepth) { return edge }
-        guard let faceHit else { return nil }
-        return .face(index: faceHit.geometryIndex, position: faceHit.worldCoordinates)
+    func snap(to standardView: CADStandardView) {
+        guard let camera = cameraNode, let target = targetNode else { return }
+        let radius = max(simd_length(camera.simdPosition - target.simdPosition), 1)
+        var orientation = CADSceneFactory.cameraOrientation(for: isPlanar ? .top : standardView)
+        // Take the short way round when interpolating.
+        if simd_dot(orientation.vector, camera.simdOrientation.vector) < 0 {
+            orientation = simd_quatf(vector: -orientation.vector)
+        }
+        let backward = orientation.act(SIMD3<Float>(0, 0, 1))
+        animateCamera(to: target.simdPosition + backward * radius, orientation: orientation, duration: 0.22)
     }
 
-    private func setHover(_ target: SmartSelectionTarget?) {
-        guard target != currentHover else { return }
-        currentHover = target
-        applyHighlight(target)
-        onHover?(target)
+    /// Drives the camera from the main run loop instead of an implicit
+    /// SceneKit animation, so every frame the 2D overlay and the view cube are
+    /// computed from exactly the transform being rendered.
+    private func animateCamera(to position: SIMD3<Float>, orientation: simd_quatf, duration: TimeInterval) {
+        cameraAnimation?.invalidate()
+        guard let camera = cameraNode else { return }
+        let startPosition = camera.simdPosition
+        let startOrientation = camera.simdOrientation
+        let startTime = CACurrentMediaTime()
+        cameraAnimation = Timer.scheduledTimer(withTimeInterval: 1 / 120, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                guard let camera = self.cameraNode else {
+                    self.cameraAnimation?.invalidate()
+                    self.cameraAnimation = nil
+                    return
+                }
+                let t = Float(min(1, (CACurrentMediaTime() - startTime) / duration))
+                let eased = t * t * (3 - 2 * t)
+                camera.simdPosition = simd_mix(startPosition, position, SIMD3<Float>(repeating: eased))
+                camera.simdOrientation = simd_slerp(startOrientation, orientation, eased)
+                self.cameraDidMove()
+                if t >= 1 {
+                    self.cameraAnimation?.invalidate()
+                    self.cameraAnimation = nil
+                }
+            }
+        }
     }
+
+    func publishCameraOrientation() {
+        guard let camera = cameraNode else { return }
+        onCameraOrientationChanged?(camera.simdOrientation)
+    }
+
+    // MARK: - Navigation
+
+    private var isPlanar: Bool { asset?.isPlanar ?? false }
 
     private func orbit(deltaX: CGFloat, deltaY: CGFloat) {
-        orbit(yaw: -deltaX * 0.008, pitch: -deltaY * 0.008)
+        // 2D drawings never rotate; the orbit gesture pans instead.
+        if isPlanar {
+            pan(deltaX: deltaX, deltaY: deltaY)
+            return
+        }
+        rotateCamera(yaw: Float(-deltaX * 0.006), pitch: Float(-deltaY * 0.006), roll: 0)
     }
 
-    private func onshapeOrbit(deltaX: CGFloat, deltaY: CGFloat) {
-        guard let camera = cameraNode,
-              let target = targetNode,
-              let root = scene?.rootNode else { return }
-        let pivot = onshapeOrbitPivot ?? asset.map(CADSceneFactory.orbitPivot) ?? target.position
-        let worldUp = normalized(camera.presentation.convertVector(SCNVector3(0, 1, 0), to: root))
-        let worldRight = normalized(camera.presentation.convertVector(SCNVector3(1, 0, 0), to: root))
+    /// Rotates the camera about the part origin using the *screen* axes: yaw about the screen's vertical axis, pitch about its
+    /// horizontal axis and roll about the axis pointing out of the screen. This
+    /// is how Onshape, SolidWorks, NX, CATIA and Creo all orbit — there is no
+    /// locked "up" direction, so the model can be viewed from any angle.
+    private func rotateCamera(yaw: Float, pitch: Float, roll: Float) {
+        guard let camera = cameraNode, let target = targetNode, !isPlanar else { return }
+        cameraAnimation?.invalidate()
+        let pivot = orbitPivot
+        let orientation = camera.simdOrientation
+        let right = orientation.act(SIMD3<Float>(1, 0, 0))
+        let up = orientation.act(SIMD3<Float>(0, 1, 0))
+        let forward = orientation.act(SIMD3<Float>(0, 0, -1))
 
-        let yaw = simd_quatf(angle: Float(-deltaX * 0.006), axis: worldUp.simdVector)
-        let pitchAxis = yaw.act(worldRight.simdVector)
-        let pitch = simd_quatf(angle: Float(-deltaY * 0.006), axis: pitchAxis)
-        let rotation = pitch * yaw
+        var rotation = simd_quatf(angle: yaw, axis: up)
+        rotation = simd_quatf(angle: pitch, axis: right) * rotation
+        if roll != 0 {
+            rotation = simd_quatf(angle: roll, axis: forward) * rotation
+        }
+        rotation = simd_normalize(rotation)
 
-        camera.position = rotated(camera.position, around: pivot, by: rotation)
-        target.position = rotated(target.position, around: pivot, by: rotation)
-        publishViewDirection()
-        refreshVectorOverlay()
-        setNeedsDisplay(bounds)
-    }
-
-    private func orbit(yaw yawDelta: CGFloat, pitch pitchDelta: CGFloat) {
-        guard let camera = cameraNode, let target = targetNode else { return }
-        let offset = subtract(camera.position, target.position)
-        let radius = max(length(offset), 0.001)
-        var yaw = atan2(offset.x, offset.z)
-        var pitch = asin(max(-1, min(1, offset.y / radius)))
-        yaw += yawDelta
-        pitch = max(-(.pi / 2 - 0.02), min(.pi / 2 - 0.02, pitch + pitchDelta))
-        let horizontal = radius * cos(pitch)
-        camera.position = add(target.position, SCNVector3(
-            horizontal * sin(yaw),
-            radius * sin(pitch),
-            horizontal * cos(yaw)
-        ))
-        publishViewDirection()
-        refreshVectorOverlay()
-        setNeedsDisplay(bounds)
+        camera.simdPosition = pivot + rotation.act(camera.simdPosition - pivot)
+        target.simdPosition = pivot + rotation.act(target.simdPosition - pivot)
+        camera.simdOrientation = simd_normalize(rotation * orientation)
+        cameraDidMove()
     }
 
     private func pan(deltaX: CGFloat, deltaY: CGFloat) {
-        guard let camera = cameraNode, let target = targetNode, let root = scene?.rootNode else { return }
-        let scale: CGFloat
+        guard let camera = cameraNode, let target = targetNode else { return }
+        cameraAnimation?.invalidate()
+        let scale: Float
         if let cameraGeometry = camera.camera, cameraGeometry.usesOrthographicProjection {
-            scale = CGFloat(cameraGeometry.orthographicScale) * 0.0026
+            scale = Float(cameraGeometry.orthographicScale) * 0.0026
         } else {
-            let distance = max(length(subtract(camera.position, target.position)), 0.001)
+            let distance = max(simd_length(camera.simdPosition - target.simdPosition), 0.001)
             scale = distance * 0.0018
         }
-        let right = camera.presentation.convertVector(SCNVector3(1, 0, 0), to: root)
-        let up = camera.presentation.convertVector(SCNVector3(0, 1, 0), to: root)
-        let translation = add(multiply(right, -deltaX * scale), multiply(up, deltaY * scale))
-        camera.position = add(camera.position, translation)
-        target.position = add(target.position, translation)
-        refreshVectorOverlay()
-        setNeedsDisplay(bounds)
+        let right = camera.simdOrientation.act(SIMD3<Float>(1, 0, 0))
+        let up = camera.simdOrientation.act(SIMD3<Float>(0, 1, 0))
+        let translation = right * Float(-deltaX) * scale + up * Float(deltaY) * scale
+        camera.simdPosition += translation
+        target.simdPosition += translation
+        cameraDidMove()
     }
 
-    private func zoom(by factor: CGFloat) {
+    /// Zooms so that the world point under `screenPoint` stays under the
+    /// cursor (zoom-to-cursor). Falls back to zooming about the view centre.
+    private func zoom(by factor: CGFloat, toward screenPoint: CGPoint? = nil) {
         guard let camera = cameraNode, let target = targetNode else { return }
-        let boundedFactor = max(0.08, min(12, factor))
+        cameraAnimation?.invalidate()
+        let boundedFactor = Float(max(0.08, min(12, factor)))
+        let anchor = screenPoint.map { worldPoint(under: $0) } ?? target.simdPosition
+
         if let cameraGeometry = camera.camera, cameraGeometry.usesOrthographicProjection {
             cameraGeometry.orthographicScale = max(
                 0.000_1,
-                CGFloat(cameraGeometry.orthographicScale) * boundedFactor
+                cameraGeometry.orthographicScale * Double(boundedFactor)
             )
-            refreshVectorOverlay()
-            setNeedsDisplay(bounds)
-            return
+            let forward = camera.simdOrientation.act(SIMD3<Float>(0, 0, -1))
+            let offset = anchor - camera.simdPosition
+            let lateral = offset - simd_dot(offset, forward) * forward
+            let shift = lateral * (1 - boundedFactor)
+            camera.simdPosition += shift
+            target.simdPosition += shift
+        } else {
+            camera.simdPosition = anchor + (camera.simdPosition - anchor) * boundedFactor
+            target.simdPosition = anchor + (target.simdPosition - anchor) * boundedFactor
         }
-        let offset = subtract(camera.position, target.position)
-        camera.position = add(target.position, multiply(offset, boundedFactor))
-        refreshVectorOverlay()
-        setNeedsDisplay(bounds)
+        cameraDidMove()
     }
 
     private func dragZoom(deltaY: CGFloat) {
@@ -309,46 +376,58 @@ final class InteractiveCADView: SCNView {
 
     private func fitView() {
         guard let asset, let camera = cameraNode, let target = targetNode else { return }
-        let pivot = CADSceneFactory.orbitPivot(for: asset)
-        let fittingRadius = CADSceneFactory.fittingRadius(for: asset, around: pivot)
-        let currentDirection = normalized(subtract(camera.position, target.position))
-        target.position = pivot
-        camera.position = add(pivot, multiply(currentDirection, fittingRadius * 3.4))
+        let pivot = CADSceneFactory.orbitPivot(for: asset).simdVector
+        let fittingRadius = Float(CADSceneFactory.fittingRadius(for: asset, around: SCNVector3(pivot)))
+        let backward = camera.simdOrientation.act(SIMD3<Float>(0, 0, 1))
+        let distance = fittingRadius * CADSceneFactory.fittingDistanceFactor
+        target.simdPosition = pivot
+        camera.simdPosition = pivot + backward * distance
         if let cameraGeometry = camera.camera, cameraGeometry.usesOrthographicProjection {
-            let fieldOfViewRadians = CGFloat(cameraGeometry.fieldOfView) * .pi / 180
-            cameraGeometry.orthographicScale = 2 * fittingRadius * 3.4 * tan(fieldOfViewRadians * 0.5)
+            let fieldOfViewRadians = Float(cameraGeometry.fieldOfView) * .pi / 180
+            cameraGeometry.orthographicScale = Double(distance * tan(fieldOfViewRadians * 0.5))
         }
-        publishViewDirection()
+        cameraDidMove()
+    }
+
+    private func cameraDidMove() {
+        publishCameraOrientation()
         refreshVectorOverlay()
         setNeedsDisplay(bounds)
     }
 
-    func snap(to standardView: CADStandardView) {
-        guard let camera = cameraNode, let target = targetNode else { return }
-        let radius = max(length(subtract(camera.position, target.position)), 1)
-        let direction: SCNVector3
-        switch standardView {
-        case .isometric: direction = normalized(SCNVector3(1, -1, 1))
-        case .top: direction = SCNVector3(0, 0.001, 1)
-        case .bottom: direction = SCNVector3(0, 0.001, -1)
-        case .front: direction = SCNVector3(0, -1, 0.001)
-        case .back: direction = SCNVector3(0, 1, 0.001)
-        case .left: direction = SCNVector3(-1, 0, 0)
-        case .right: direction = SCNVector3(1, 0, 0)
+    /// World point under a screen location: the surface under the cursor if
+    /// there is one, otherwise the point on the focal plane through the target.
+    private func worldPoint(under screenPoint: CGPoint) -> SIMD3<Float> {
+        let hits = hitTest(screenPoint, options: [
+            .categoryBitMask: 1,
+            .searchMode: SCNHitTestSearchMode.closest.rawValue,
+            .ignoreHiddenNodes: false
+        ])
+        if let hit = hits.first {
+            return hit.worldCoordinates.simdVector
         }
-        SCNTransaction.begin()
-        SCNTransaction.animationDuration = 0.22
-        SCNTransaction.animationTimingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        camera.position = add(target.position, multiply(direction, radius))
-        SCNTransaction.commit()
-        publishViewDirection()
-        refreshVectorOverlay()
-        setNeedsDisplay(bounds)
+        let target = targetNode?.simdPosition ?? .zero
+        return projector?.unproject(screenPoint, atDepthOf: target) ?? target
     }
 
-    func publishViewDirection() {
-        guard let camera = cameraNode, let target = targetNode else { return }
-        onViewDirectionChanged?(normalized(subtract(camera.position, target.position)))
+    /// Projects through the camera node's *model* transform rather than
+    /// SCNView.projectPoint, which reads the renderer's last-drawn state and so
+    /// lags one frame behind while the camera moves.
+    private var projector: CADScreenProjector? {
+        guard let camera = cameraNode, let cameraGeometry = camera.camera,
+              bounds.width > 0, bounds.height > 0 else { return nil }
+        return CADScreenProjector(
+            view: simd_inverse(camera.simdWorldTransform),
+            projection: simd_float4x4(cameraGeometry.projectionTransform(withViewportSize: bounds.size)),
+            size: bounds.size
+        )
+    }
+
+    /// Depth slack (in view-space units) when deciding whether an edge or
+    /// vertex is hidden behind the face under the cursor.
+    private var depthTolerance: Float {
+        guard let camera = cameraNode, let target = targetNode else { return 0.01 }
+        return 0.005 * max(simd_length(camera.simdPosition - target.simdPosition), 1)
     }
 
     private var cameraNode: SCNNode? {
@@ -363,63 +442,56 @@ final class InteractiveCADView: SCNView {
         CADPreferences.navigationPreset
     }
 
-    private func add(_ a: SCNVector3, _ b: SCNVector3) -> SCNVector3 {
-        SCNVector3(a.x + b.x, a.y + b.y, a.z + b.z)
+    // MARK: - Picking and highlighting
+
+    private func target(at screenPoint: CGPoint) -> SmartSelectionTarget? {
+        guard let projector else { return nil }
+        let hits = hitTest(screenPoint, options: [
+            .categoryBitMask: 1,
+            .searchMode: SCNHitTestSearchMode.all.rawValue,
+            .ignoreHiddenNodes: false,
+            .boundingBoxOnly: false
+        ])
+        let faceHit = hits.first
+        let visibleDepth = faceHit.flatMap { projector.project($0.worldCoordinates.simdVector)?.depth }
+        if let vertex = nearestVertex(to: screenPoint, noFartherThan: visibleDepth, projector: projector) { return vertex }
+        if let edge = nearestEdge(to: screenPoint, noFartherThan: visibleDepth, projector: projector) { return edge }
+        guard let faceHit, let asset, asset.triangles.indices.contains(faceHit.faceIndex) else { return nil }
+        return .face(index: Int(asset.triangles[faceHit.faceIndex].faceIndex), position: faceHit.worldCoordinates)
     }
 
-    private func subtract(_ a: SCNVector3, _ b: SCNVector3) -> SCNVector3 {
-        SCNVector3(a.x - b.x, a.y - b.y, a.z - b.z)
+    private func setHover(_ target: SmartSelectionTarget?) {
+        guard target != currentHover else { return }
+        currentHover = target
+        applyHighlight(target)
+        onHover?(target)
     }
 
-    private func multiply(_ vector: SCNVector3, _ scalar: CGFloat) -> SCNVector3 {
-        SCNVector3(vector.x * scalar, vector.y * scalar, vector.z * scalar)
-    }
-
-    private func length(_ vector: SCNVector3) -> CGFloat {
-        sqrt(vector.x * vector.x + vector.y * vector.y + vector.z * vector.z)
-    }
-
-    private func normalized(_ vector: SCNVector3) -> SCNVector3 {
-        let magnitude = max(length(vector), 0.0001)
-        return multiply(vector, 1 / magnitude)
-    }
-
-    private func rotated(_ point: SCNVector3, around pivot: SCNVector3, by rotation: simd_quatf) -> SCNVector3 {
-        let offset = subtract(point, pivot).simdVector
-        return add(pivot, SCNVector3(rotation.act(offset)))
-    }
-
+    /// Faces are highlighted with a separate overlay node holding just that
+    /// face's triangles; the model geometry itself is never mutated (mutating
+    /// its materials races SceneKit's render thread). Edges are highlighted
+    /// only in the 2D overlay.
     private func applyHighlight(_ target: SmartSelectionTarget?) {
-        if let index = highlightedFace,
-           let geometry = scene?.rootNode.childNode(withName: CADSceneFactory.surfaceNodeName, recursively: true)?.geometry,
-           geometry.materials.indices.contains(index), let surfaceBaseMaterial {
-            geometry.materials[index] = surfaceBaseMaterial
-        }
-        if let index = highlightedEdge,
-           let geometry = scene?.rootNode.childNode(withName: CADSceneFactory.edgeNodeName, recursively: true)?.geometry,
-           geometry.materials.indices.contains(index), let edgeBaseMaterial {
-            geometry.materials[index] = edgeBaseMaterial
-        }
+        faceHighlightNode?.removeFromParentNode()
+        faceHighlightNode = nil
         highlightedEdgePoints = []
-        highlightedFace = nil
-        highlightedEdge = nil
+        highlightedVertex = nil
 
         switch target {
         case .face(let index, _):
-            if let geometry = scene?.rootNode.childNode(withName: CADSceneFactory.surfaceNodeName, recursively: true)?.geometry,
-               geometry.materials.indices.contains(index) {
-                surfaceBaseMaterial = surfaceBaseMaterial ?? geometry.materials[index]
-                geometry.materials[index] = surfaceHighlightMaterial()
-                highlightedFace = index
+            if let asset,
+               let geometry = CADSceneFactory.makeFaceHighlightGeometry(for: asset, faceIndex: index),
+               let modelRoot = scene?.rootNode.childNode(withName: CADSceneFactory.modelNodeName, recursively: false) {
+                let node = SCNNode(geometry: geometry)
+                node.name = "CADFaceHighlight"
+                node.categoryBitMask = 8
+                modelRoot.addChildNode(node)
+                faceHighlightNode = node
             }
         case .edge(let index, _):
-            if let geometry = scene?.rootNode.childNode(withName: CADSceneFactory.edgeNodeName, recursively: true)?.geometry,
-               geometry.materials.indices.contains(index) {
-                edgeBaseMaterial = edgeBaseMaterial ?? geometry.materials[index]
-                geometry.materials[index] = highlightMaterial()
-                highlightedEdgePoints = edgePoints(index: index)
-                highlightedEdge = index
-            }
+            highlightedEdgePoints = edgePoints(index: index)
+        case .vertex(_, let position):
+            highlightedVertex = position
         case nil:
             break
         }
@@ -427,38 +499,57 @@ final class InteractiveCADView: SCNView {
         setNeedsDisplay(bounds)
     }
 
-    private func nearestEdge(to screenPoint: CGPoint, noFartherThan visibleDepth: CGFloat?) -> SmartSelectionTarget? {
+    /// B-Rep vertices snap from further away than edges so they win when the
+    /// cursor is near an edge end point.
+    private func nearestVertex(
+        to screenPoint: CGPoint,
+        noFartherThan visibleDepth: Float?,
+        projector: CADScreenProjector
+    ) -> SmartSelectionTarget? {
         guard let asset else { return nil }
+        let tolerance = depthTolerance
+        var bestDistance: CGFloat = 9
+        var best: SmartSelectionTarget?
+        for (index, vertex) in asset.topologicalVertices.enumerated() {
+            guard let projected = projector.project(vertex.simdVector) else { continue }
+            if let visibleDepth, projected.depth > visibleDepth + tolerance { continue }
+            let distance = hypot(projected.point.x - screenPoint.x, projected.point.y - screenPoint.y)
+            if distance < bestDistance {
+                bestDistance = distance
+                best = .vertex(index: index, position: vertex)
+            }
+        }
+        return best
+    }
+
+    private func nearestEdge(
+        to screenPoint: CGPoint,
+        noFartherThan visibleDepth: Float?,
+        projector: CADScreenProjector
+    ) -> SmartSelectionTarget? {
+        guard let asset else { return nil }
+        let tolerance = depthTolerance
         var bestDistance = CGFloat.greatestFiniteMagnitude
         var bestEdge: Int?
         var bestPoint = SCNVector3Zero
+        let points = asset.polylineSimd
 
         for (edgeIndex, edge) in asset.edges.enumerated() {
             let first = Int(edge.firstPoint)
             let count = Int(edge.pointCount)
-            guard count > 1, first + count <= asset.polylinePoints.count else { continue }
+            guard count > 1, first + count <= points.count else { continue }
             for offset in 0..<(count - 1) {
-                let worldA = asset.polylinePoints[first + offset].sceneVector
-                let worldB = asset.polylinePoints[first + offset + 1].sceneVector
-                let projectedA = projectPoint(worldA)
-                let projectedB = projectPoint(worldB)
-                guard projectedA.z >= 0, projectedA.z <= 1, projectedB.z >= 0, projectedB.z <= 1 else { continue }
-                let result = distance(
-                    from: screenPoint,
-                    toSegmentFrom: CGPoint(x: projectedA.x, y: projectedA.y),
-                    to: CGPoint(x: projectedB.x, y: projectedB.y)
-                )
-                let projectedDepth = projectedA.z + (projectedB.z - projectedA.z) * result.fraction
-                if let visibleDepth, projectedDepth > visibleDepth + 0.004 { continue }
+                let worldA = points[first + offset]
+                let worldB = points[first + offset + 1]
+                guard let projectedA = projector.project(worldA),
+                      let projectedB = projector.project(worldB) else { continue }
+                let result = distance(from: screenPoint, toSegmentFrom: projectedA.point, to: projectedB.point)
+                let projectedDepth = projectedA.depth + (projectedB.depth - projectedA.depth) * Float(result.fraction)
+                if let visibleDepth, projectedDepth > visibleDepth + tolerance { continue }
                 if result.distance < bestDistance {
                     bestDistance = result.distance
                     bestEdge = edgeIndex
-                    let fraction = result.fraction
-                    bestPoint = SCNVector3(
-                        worldA.x + (worldB.x - worldA.x) * fraction,
-                        worldA.y + (worldB.y - worldA.y) * fraction,
-                        worldA.z + (worldB.z - worldA.z) * fraction
-                    )
+                    bestPoint = SCNVector3(simd_mix(worldA, worldB, SIMD3<Float>(repeating: Float(result.fraction))))
                 }
             }
         }
@@ -486,32 +577,47 @@ final class InteractiveCADView: SCNView {
     }
 
     private func refreshVectorOverlay() {
-        vectorOverlay.selectionPoints = highlightedEdgePoints.map {
-            let point = projectPoint($0)
-            return CGPoint(x: CGFloat(point.x), y: CGFloat(point.y))
+        guard let projector else {
+            vectorOverlay.selectionPoints = []
+            vectorOverlay.measurementPoints = []
+            vectorOverlay.vertexPoint = nil
+            vectorOverlay.axes = []
+            vectorOverlay.originPoint = nil
+            return
         }
-        vectorOverlay.measurementPoints = measurementPoints.map {
-            let point = projectPoint($0)
-            return CGPoint(x: CGFloat(point.x), y: CGFloat(point.y))
-        }
+        vectorOverlay.selectionPoints = highlightedEdgePoints.compactMap { projector.project($0.simdVector)?.point }
+        vectorOverlay.measurementPoints = measurementPoints.compactMap { projector.project($0.simdVector)?.point }
+        vectorOverlay.vertexPoint = highlightedVertex.flatMap { projector.project($0.simdVector)?.point }
+        updateAxisOverlay(projector)
     }
 
-    private func highlightMaterial() -> SCNMaterial {
-        let material = SCNMaterial()
-        material.diffuse.contents = NSColor.systemOrange
-        material.emission.contents = NSColor.systemOrange
-        material.lightingModel = .constant
-        return material
-    }
-
-    private func surfaceHighlightMaterial() -> SCNMaterial {
-        let material = SCNMaterial()
-        material.diffuse.contents = NSColor.systemOrange
-        material.emission.contents = NSColor.systemOrange.withAlphaComponent(0.35)
-        material.metalness.contents = 0.15
-        material.roughness.contents = 0.28
-        material.isDoubleSided = true
-        return material
+    /// Draws the model origin and X/Y/Z axes as a screen-space triad: a fixed
+    /// on-screen length, foreshortened by how much each axis points at the camera.
+    private func updateAxisOverlay(_ projector: CADScreenProjector) {
+        guard let camera = cameraNode,
+              let origin = projector.project(.zero),
+              let reference = projector.project(camera.simdOrientation.act(SIMD3<Float>(1, 0, 0)) * axisProbeLength)
+        else {
+            vectorOverlay.axes = []
+            vectorOverlay.originPoint = nil
+            return
+        }
+        let referenceLength = hypot(reference.point.x - origin.point.x, reference.point.y - origin.point.y)
+        let scale = 56 / max(referenceLength, 0.001)
+        let axes: [(String, SIMD3<Float>, NSColor)] = [
+            ("X", SIMD3<Float>(1, 0, 0), .systemRed),
+            ("Y", SIMD3<Float>(0, 1, 0), .systemGreen),
+            ("Z", SIMD3<Float>(0, 0, 1), .systemBlue)
+        ]
+        vectorOverlay.axes = axes.compactMap { label, direction, color in
+            guard let tip = projector.project(direction * axisProbeLength) else { return nil }
+            let end = CGPoint(
+                x: origin.point.x + (tip.point.x - origin.point.x) * scale,
+                y: origin.point.y + (tip.point.y - origin.point.y) * scale
+            )
+            return CADOverlayAxis(start: origin.point, end: end, color: color, label: label)
+        }
+        vectorOverlay.originPoint = origin.point
     }
 
 }
@@ -520,6 +626,11 @@ final class InteractiveCADView: SCNView {
 private final class CADVectorOverlayView: NSView {
     var selectionPoints: [CGPoint] = [] { didSet { needsDisplay = true } }
     var measurementPoints: [CGPoint] = [] { didSet { needsDisplay = true } }
+    var vertexPoint: CGPoint? { didSet { needsDisplay = true } }
+    var axes: [CADOverlayAxis] = [] { didSet { needsDisplay = true } }
+    var originPoint: CGPoint? { didSet { needsDisplay = true } }
+
+    private let axisLabelFont = NSFont(name: "Helvetica-Bold", size: 12) ?? .boldSystemFont(ofSize: 12)
 
     override var isOpaque: Bool { false }
 
@@ -527,6 +638,7 @@ private final class CADVectorOverlayView: NSView {
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
+        drawAxes()
         NSColor.systemOrange.setStroke()
         NSColor.systemOrange.setFill()
 
@@ -534,7 +646,52 @@ private final class CADVectorOverlayView: NSView {
         for point in measurementPoints.prefix(2) {
             NSBezierPath(ovalIn: NSRect(x: point.x - 4, y: point.y - 4, width: 8, height: 8)).fill()
         }
-        stroke(points: selectionPoints, lineWidth: 5)
+        stroke(points: selectionPoints, lineWidth: 4)
+
+        if let vertexPoint {
+            let ring = NSBezierPath(ovalIn: NSRect(x: vertexPoint.x - 6, y: vertexPoint.y - 6, width: 12, height: 12))
+            ring.lineWidth = 2
+            ring.stroke()
+            NSBezierPath(ovalIn: NSRect(x: vertexPoint.x - 2.5, y: vertexPoint.y - 2.5, width: 5, height: 5)).fill()
+        }
+    }
+
+    private func drawAxes() {
+        for axis in axes {
+            axis.color.setStroke()
+            let path = NSBezierPath()
+            path.move(to: axis.start)
+            path.line(to: axis.end)
+            path.lineWidth = 2
+            path.lineCapStyle = .round
+            path.stroke()
+
+            let dx = axis.end.x - axis.start.x
+            let dy = axis.end.y - axis.start.y
+            let length = max(hypot(dx, dy), 0.001)
+            let labelCenter = CGPoint(x: axis.end.x + dx / length * 10, y: axis.end.y + dy / length * 10)
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: axisLabelFont,
+                .foregroundColor: axis.color,
+                .shadow: {
+                    let shadow = NSShadow()
+                    shadow.shadowColor = NSColor.black.withAlphaComponent(0.6)
+                    shadow.shadowBlurRadius = 2
+                    return shadow
+                }()
+            ]
+            let size = axis.label.size(withAttributes: attributes)
+            axis.label.draw(
+                at: CGPoint(x: labelCenter.x - size.width / 2, y: labelCenter.y - size.height / 2),
+                withAttributes: attributes
+            )
+        }
+        if let originPoint {
+            NSColor.black.withAlphaComponent(0.5).setFill()
+            NSBezierPath(ovalIn: NSRect(x: originPoint.x - 4.5, y: originPoint.y - 4.5, width: 9, height: 9)).fill()
+            NSColor.white.setFill()
+            NSBezierPath(ovalIn: NSRect(x: originPoint.x - 3, y: originPoint.y - 3, width: 6, height: 6)).fill()
+        }
     }
 
     private func stroke(points: [CGPoint], lineWidth: CGFloat) {
@@ -549,14 +706,55 @@ private final class CADVectorOverlayView: NSView {
     }
 }
 
+struct CADOverlayAxis {
+    let start: CGPoint
+    let end: CGPoint
+    let color: NSColor
+    let label: String
+}
+
+/// Projects world points to AppKit view coordinates using the camera's
+/// current (not last-rendered) transform.
+struct CADScreenProjector {
+    let view: simd_float4x4
+    let projection: simd_float4x4
+    let size: CGSize
+
+    /// Screen point (origin bottom-left) and linear view-space depth, or nil
+    /// when the point is behind the camera.
+    func project(_ world: SIMD3<Float>) -> (point: CGPoint, depth: Float)? {
+        let viewPosition = view * SIMD4<Float>(world, 1)
+        let depth = -viewPosition.z
+        guard depth > 0 else { return nil }
+        let clip = projection * viewPosition
+        guard clip.w > 0 else { return nil }
+        let x = CGFloat((clip.x / clip.w + 1) * 0.5) * size.width
+        let y = CGFloat((clip.y / clip.w + 1) * 0.5) * size.height
+        return (CGPoint(x: x, y: y), depth)
+    }
+
+    func unproject(_ screen: CGPoint, atDepthOf world: SIMD3<Float>) -> SIMD3<Float> {
+        let viewProjection = projection * view
+        let reference = viewProjection * SIMD4<Float>(world, 1)
+        let ndc = SIMD4<Float>(
+            Float(screen.x / size.width) * 2 - 1,
+            Float(screen.y / size.height) * 2 - 1,
+            reference.z / reference.w,
+            1
+        )
+        let result = simd_inverse(viewProjection) * ndc
+        return SIMD3<Float>(result.x, result.y, result.z) / result.w
+    }
+}
+
 private extension SmartSelectionTarget {
     var position: SCNVector3 {
         switch self {
-        case .edge(_, let position), .face(_, let position): position
+        case .vertex(_, let position), .edge(_, let position), .face(_, let position): position
         }
     }
 }
 
-private extension SCNVector3 {
+extension SCNVector3 {
     var simdVector: SIMD3<Float> { SIMD3<Float>(Float(x), Float(y), Float(z)) }
 }
