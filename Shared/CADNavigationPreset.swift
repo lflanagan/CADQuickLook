@@ -43,171 +43,107 @@ enum CADCameraProjection: String, CaseIterable, Identifiable {
     var title: String { rawValue.capitalized }
 }
 
+enum CADLengthUnit: String, CaseIterable, Identifiable {
+    case millimeters
+    case centimeters
+    case meters
+    case inches
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .millimeters: "Millimeters"
+        case .centimeters: "Centimeters"
+        case .meters: "Meters"
+        case .inches: "Inches"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .millimeters: "mm"
+        case .centimeters: "cm"
+        case .meters: "m"
+        case .inches: "in"
+        }
+    }
+
+    /// Multiplier from model millimetres (Open CASCADE's import unit) to this unit.
+    var scale: Double {
+        switch self {
+        case .millimeters: 1
+        case .centimeters: 0.1
+        case .meters: 0.001
+        case .inches: 1 / 25.4
+        }
+    }
+
+    var fractionDigits: Int {
+        switch self {
+        case .millimeters: 3
+        case .centimeters: 4
+        case .meters: 6
+        case .inches: 4
+        }
+    }
+}
+
 extension Notification.Name {
     static let cadCameraProjectionDidChange = Notification.Name("cadCameraProjectionDidChange")
+    static let cadLengthUnitDidChange = Notification.Name("cadLengthUnitDidChange")
 }
 
 enum CADPreferences {
     static let suiteName = "com.liamflanagan.CADQuickLook"
-    static let previewSuiteName = "com.liamflanagan.CADQuickLook.Preview"
     static let navigationPresetKey = "navigationPreset"
-    private static let navigationPresetModifiedAtKey = "navigationPresetModifiedAt"
     static let cameraProjectionKey = "cameraProjection"
-    private static let cameraProjectionModifiedAtKey = "cameraProjectionModifiedAt"
+    static let lengthUnitKey = "lengthUnit"
+
+    /// App Group shared by the app and both Quick Look extensions. The
+    /// identifier is expanded into Info.plist from the signing team at build
+    /// time (see CAD_APP_GROUP in project.yml).
+    static let appGroupIdentifier: String? = {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: "CADAppGroup") as? String,
+              !value.isEmpty, !value.hasPrefix("."), !value.contains("$(") else { return nil }
+        return value
+    }()
+
+    nonisolated(unsafe) private static let defaults: UserDefaults = {
+        if let appGroupIdentifier, let shared = UserDefaults(suiteName: appGroupIdentifier) {
+            return shared
+        }
+        return .standard
+    }()
 
     static var navigationPreset: CADNavigationPreset {
-        let rawValue = resolvedRawValue(
-            valueKey: navigationPresetKey,
-            modifiedAtKey: navigationPresetModifiedAtKey
-        )
-        return rawValue.flatMap(CADNavigationPreset.init(rawValue:)) ?? .onshape
+        rawValue(forKey: navigationPresetKey).flatMap(CADNavigationPreset.init(rawValue:)) ?? .onshape
     }
 
     static func setNavigationPreset(_ preset: CADNavigationPreset) {
-        setRawValue(
-            preset.rawValue,
-            valueKey: navigationPresetKey,
-            modifiedAtKey: navigationPresetModifiedAtKey
-        )
+        defaults.set(preset.rawValue, forKey: navigationPresetKey)
     }
 
     static var cameraProjection: CADCameraProjection {
-        let rawValue = resolvedRawValue(
-            valueKey: cameraProjectionKey,
-            modifiedAtKey: cameraProjectionModifiedAtKey
-        )
-        return rawValue.flatMap(CADCameraProjection.init(rawValue:)) ?? .perspective
+        rawValue(forKey: cameraProjectionKey).flatMap(CADCameraProjection.init(rawValue:)) ?? .orthographic
     }
 
     static func setCameraProjection(_ projection: CADCameraProjection) {
-        setRawValue(
-            projection.rawValue,
-            valueKey: cameraProjectionKey,
-            modifiedAtKey: cameraProjectionModifiedAtKey
-        )
+        defaults.set(projection.rawValue, forKey: cameraProjectionKey)
         NotificationCenter.default.post(name: .cadCameraProjectionDidChange, object: projection)
     }
 
-    private static func resolvedRawValue(valueKey: String, modifiedAtKey: String) -> String? {
-        var preferences = [
-            currentProcessPreference(valueKey: valueKey, modifiedAtKey: modifiedAtKey),
-            storedPreference(in: suiteName, valueKey: valueKey, modifiedAtKey: modifiedAtKey)
-        ]
-        if Bundle.main.bundleIdentifier == suiteName {
-            preferences.append(previewContainerPreference(valueKey: valueKey, modifiedAtKey: modifiedAtKey))
-        }
-        return preferences
-            .compactMap { $0 }
-            .max { $0.modifiedAt < $1.modifiedAt }?
-            .rawValue
+    static var lengthUnit: CADLengthUnit {
+        rawValue(forKey: lengthUnitKey).flatMap(CADLengthUnit.init(rawValue:)) ?? .millimeters
     }
 
-    private static func setRawValue(_ rawValue: String, valueKey: String, modifiedAtKey: String) {
-        let modifiedAt = Date().timeIntervalSince1970
-        UserDefaults.standard.set(rawValue, forKey: valueKey)
-        UserDefaults.standard.set(modifiedAt, forKey: modifiedAtKey)
-        UserDefaults.standard.synchronize()
-        write(
-            rawValue: rawValue,
-            modifiedAt: modifiedAt,
-            valueKey: valueKey,
-            modifiedAtKey: modifiedAtKey,
-            to: suiteName
-        )
-
-        // The containing app is unsandboxed and can keep the Quick Look
-        // extension's writable mirror aligned with its Settings window.
-        if Bundle.main.bundleIdentifier == suiteName {
-            writePreviewContainerPreference(
-                rawValue: rawValue,
-                modifiedAt: modifiedAt,
-                valueKey: valueKey,
-                modifiedAtKey: modifiedAtKey
-            )
-        }
+    static func setLengthUnit(_ unit: CADLengthUnit) {
+        defaults.set(unit.rawValue, forKey: lengthUnitKey)
+        NotificationCenter.default.post(name: .cadLengthUnitDidChange, object: unit)
     }
 
-    private static func currentProcessPreference(
-        valueKey: String,
-        modifiedAtKey: String
-    ) -> (rawValue: String, modifiedAt: Double)? {
-        guard let rawValue = UserDefaults.standard.string(forKey: valueKey) else { return nil }
-        return (rawValue, UserDefaults.standard.double(forKey: modifiedAtKey))
-    }
-
-    private static func storedPreference(
-        in suite: String,
-        valueKey: String,
-        modifiedAtKey: String
-    ) -> (rawValue: String, modifiedAt: Double)? {
-        guard let defaults = UserDefaults(suiteName: suite),
-              let rawValue = defaults.string(forKey: valueKey) else { return nil }
-        let modifiedAt = defaults.double(forKey: modifiedAtKey)
-        return (rawValue, modifiedAt)
-    }
-
-    private static func previewContainerPreference(
-        valueKey: String,
-        modifiedAtKey: String
-    ) -> (rawValue: String, modifiedAt: Double)? {
-        guard let dictionary = previewContainerDictionary(),
-              let rawValue = dictionary[valueKey] as? String else { return nil }
-        let modifiedAt = (dictionary[modifiedAtKey] as? NSNumber)?.doubleValue ?? 0
-        return (rawValue, modifiedAt)
-    }
-
-    private static func writePreviewContainerPreference(
-        rawValue: String,
-        modifiedAt: Double,
-        valueKey: String,
-        modifiedAtKey: String
-    ) {
-        var dictionary = previewContainerDictionary() ?? [:]
-        dictionary[valueKey] = rawValue
-        dictionary[modifiedAtKey] = modifiedAt
-        guard let data = try? PropertyListSerialization.data(
-            fromPropertyList: dictionary,
-            format: .binary,
-            options: 0
-        ) else { return }
-        try? data.write(to: previewPreferencesURL, options: .atomic)
-    }
-
-    private static func previewContainerDictionary() -> [String: Any]? {
-        guard let data = try? Data(contentsOf: previewPreferencesURL),
-              let propertyList = try? PropertyListSerialization.propertyList(
-                from: data,
-                options: [],
-                format: nil
-              ) else { return nil }
-        return propertyList as? [String: Any]
-    }
-
-    private static var previewPreferencesURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Containers", isDirectory: true)
-            .appendingPathComponent(previewSuiteName, isDirectory: true)
-            .appendingPathComponent("Data/Library/Preferences", isDirectory: true)
-            .appendingPathComponent("\(previewSuiteName).plist")
-    }
-
-    private static func write(
-        rawValue: String,
-        modifiedAt: Double,
-        valueKey: String,
-        modifiedAtKey: String,
-        to suite: String
-    ) {
-        CFPreferencesSetAppValue(
-            valueKey as CFString,
-            rawValue as CFString,
-            suite as CFString
-        )
-        CFPreferencesSetAppValue(
-            modifiedAtKey as CFString,
-            modifiedAt as CFNumber,
-            suite as CFString
-        )
-        CFPreferencesAppSynchronize(suite as CFString)
+    /// Group value first; falls back to the pre-App-Group per-process value.
+    private static func rawValue(forKey key: String) -> String? {
+        defaults.string(forKey: key) ?? UserDefaults.standard.string(forKey: key)
     }
 }

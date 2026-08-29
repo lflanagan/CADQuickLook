@@ -42,7 +42,28 @@ settings:
       - -lTKMath
       - -lTKernel
     SWIFT_VERSION: "6.0"
-    CODE_SIGN_STYLE: Automatic
+    # Ad-hoc signed by default. script/build_and_run.sh switches to an Apple
+    # Development certificate when DEVELOPMENT_TEAM is set in the environment,
+    # which gives the build a stable identity (macOS then remembers privacy
+    # consents instead of asking on every launch).
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    # App Group shared by the app and both Quick Look extensions (preferences).
+    # It must be prefixed with the signing team's ID; without a team the
+    # identifier is invalid and the app falls back to per-process defaults.
+    CAD_APP_GROUP: $(DEVELOPMENT_TEAM).com.liamflanagan.CADQuickLook
+    # The Open CASCADE bridge is the hot path for every load; keep the C++
+    # optimized even in Debug builds so development/Quick Look testing is
+    # representative.
+    GCC_OPTIMIZATION_LEVEL: 2
+
+# Pinned to an exact version: CADQuickLook.xcodeproj/…/Package.resolved is not
+# committed, so this is the only place the Sparkle version is recorded.
+# Keep in sync with SPARKLE_VERSION in .github/workflows/release.yml.
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.9.6
 
 targets:
   CADQuickLook:
@@ -68,6 +89,7 @@ targets:
         embed: true
       - target: CADQuickLookThumbnail
         embed: true
+      - package: Sparkle
 
   CADQuickLookPreview:
     type: app-extension

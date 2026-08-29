@@ -1,0 +1,137 @@
+# Publishes a Sparkle appcast.xml as an asset of the GitHub release that was
+# just published. The app zip itself is still built, Developer-ID-signed and
+# notarized locally by script/package_release.sh (the runner has no Developer
+# ID certificate and does not need one: the appcast only needs the Ed25519
+# key, which lives in the SPARKLE_PRIVATE_KEY repository secret).
+#
+# Flow:  package_release.sh  ->  gh release create vX.Y.Z dist/*.zip  ->  (this)
+#
+# Setup once:
+#   generate_keys -x sparkle_ed25519.key          # export from login Keychain
+#   gh secret set SPARKLE_PRIVATE_KEY < sparkle_ed25519.key
+#   rm -P sparkle_ed25519.key                     # keep a copy in a password manager
+#
+# Caveat: between "release published" and this job finishing (~1-2 min),
+# https://github.com/<repo>/releases/latest/download/appcast.xml returns 404.
+# Sparkle background checks just log the failure and retry on the next
+# interval, so this is harmless. To avoid it entirely, create the release as
+# a draft, run this workflow via workflow_dispatch with the tag, then publish.
+
+name: Publish Sparkle appcast
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to (re)generate the appcast for, e.g. v0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write   # gh release download/upload
+
+concurrency:
+  group: appcast
+  cancel-in-progress: false
+
+env:
+  SPARKLE_VERSION: "2.9.6"   # keep in sync with project.yml
+  # sha256 of Sparkle-2.9.6.tar.xz from the GitHub release; update together with the version.
+  SPARKLE_SHA256: "52bf9e88cdd972fc0c81501377a880e90d47031bd8ca5462488f843e2609e192"
+  APP_NAME: CADQuickLook
+
+jobs:
+  appcast:
+    runs-on: macos-15
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          tag="${EVENT_TAG:-$INPUT_TAG}"
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Unexpected tag: $tag" >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Download Sparkle tools
+        run: |
+          curl -fsSL -o sparkle.tar.xz \
+            "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+          # The tools that sign the update feed come from this archive; verify it.
+          echo "${SPARKLE_SHA256}  sparkle.tar.xz" | shasum -a 256 -c -
+          mkdir -p sparkle && tar -xJf sparkle.tar.xz -C sparkle
+          ./sparkle/bin/generate_appcast --help >/dev/null
+
+      - name: Download release archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          mkdir -p updates
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern "${APP_NAME}-*-arm64.zip" --dir updates
+          ls -l updates
+
+      - name: Fetch previous appcast (keeps older items in the feed)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          prev="$(gh release list --repo "$GITHUB_REPOSITORY" --exclude-drafts --exclude-pre-releases \
+                   --json tagName --jq "[.[].tagName | select(. != \"$TAG\")] | .[0] // empty")"
+          if [[ -n "$prev" ]]; then
+            gh release download "$prev" --repo "$GITHUB_REPOSITORY" --pattern appcast.xml --dir updates || \
+              echo "No appcast.xml on $prev; starting a fresh feed."
+          fi
+
+      - name: Write release notes next to the archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          # generate_appcast picks up <archive-basename>.md and, with
+          # --embed-release-notes, inlines it as the item's <description>.
+          archive="$(ls updates/${APP_NAME}-*-arm64.zip)"
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body \
+            > "${archive%.zip}.md"
+
+      - name: Generate and sign appcast
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ -n "$SPARKLE_PRIVATE_KEY" ]] || { echo "SPARKLE_PRIVATE_KEY secret is not set" >&2; exit 1; }
+          umask 077
+          key="$RUNNER_TEMP/sparkle_ed25519.key"
+          printf '%s' "$SPARKLE_PRIVATE_KEY" > "$key"
+          trap 'rm -f "$key"' EXIT
+
+          ./sparkle/bin/generate_appcast \
+            --ed-key-file "$key" \
+            --download-url-prefix "https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/" \
+            --link "https://github.com/${GITHUB_REPOSITORY}" \
+            --full-release-notes-url "https://github.com/${GITHUB_REPOSITORY}/releases" \
+            --embed-release-notes \
+            --maximum-versions 5 \
+            updates 2>&1 | tee generate_appcast.log
+
+          # generate_appcast only WARNS when the key does not match SUPublicEDKey
+          # inside the app; treat that as fatal, otherwise clients reject the update.
+          if grep -q "does not match" generate_appcast.log; then
+            echo "Ed25519 key in secret does not match SUPublicEDKey in the app." >&2
+            exit 1
+          fi
+          test -s updates/appcast.xml
+          cat updates/appcast.xml
+
+      - name: Upload appcast.xml to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          gh release upload "$TAG" updates/appcast.xml --repo "$GITHUB_REPOSITORY" --clobber
+          echo "Feed: https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/appcast.xml"

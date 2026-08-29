@@ -17,6 +17,10 @@
 #include <Poly_Triangulation.hxx>
 #include <Precision.hxx>
 #include <STEPCAFControl_Reader.hxx>
+#include <ShapeProcess.hxx>
+#include <Message_ProgressIndicator.hxx>
+#include <Message_ProgressScope.hxx>
+#include <IMeshTools_Parameters.hxx>
 #include <STEPControl_Reader.hxx>
 #include <Standard_Failure.hxx>
 #include <StlAPI_Reader.hxx>
@@ -49,6 +53,7 @@
 struct CADBridgeModel {
     TopoDS_Shape shape;
     std::vector<TopoDS_Face> faces;
+    std::vector<TopoDS_Edge> edgeShapes;
     std::vector<CADVertex> vertices;
     std::vector<CADTriangle> triangles;
     std::vector<CADFaceRange> faceRanges;
@@ -57,9 +62,46 @@ struct CADBridgeModel {
     CADBounds bounds{};
     CADModelStats stats{};
     std::string error;
+
+    CADBridgeProgressCallback progressCallback = nullptr;
+    void *progressContext = nullptr;
+    std::mutex progressMutex;
+    CADLoadStage lastStage = CADLoadStageReading;
+    double lastFraction = -2.0;
 };
 
 namespace {
+
+// Forwards progress to the host, throttled to stage changes and 1% steps.
+void reportProgress(CADBridgeModel& model, CADLoadStage stage, double fraction, uint32_t count = 0) {
+    if (!model.progressCallback) return;
+    std::lock_guard<std::mutex> lock(model.progressMutex);
+    if (stage == model.lastStage && fraction >= 0.0 && model.lastFraction >= 0.0 &&
+        std::fabs(fraction - model.lastFraction) < 0.01) {
+        return;
+    }
+    model.lastStage = stage;
+    model.lastFraction = fraction;
+    model.progressCallback(model.progressContext, stage, fraction, count);
+}
+
+// Adapts OCCT's progress reporting (STEP transfer, BRepMesh) to reportProgress.
+class BridgeProgressIndicator : public Message_ProgressIndicator {
+public:
+    BridgeProgressIndicator(CADBridgeModel& model, CADLoadStage stage, uint32_t count)
+        : model_(model), stage_(stage), count_(count) {}
+
+    void Show(const Message_ProgressScope&, const Standard_Boolean) override {
+        reportProgress(model_, stage_, GetPosition(), count_);
+    }
+
+    Standard_Boolean UserBreak() override { return Standard_False; }
+
+private:
+    CADBridgeModel& model_;
+    CADLoadStage stage_;
+    uint32_t count_;
+};
 
 // STEP/IGES translation consults process-global OCCT resource/configuration
 // state. Quick Look may issue multiple thumbnail requests concurrently, so keep
@@ -74,6 +116,7 @@ CADPoint3D point(const gp_Pnt& value) {
 void clearModel(CADBridgeModel& model) {
     model.shape.Nullify();
     model.faces.clear();
+    model.edgeShapes.clear();
     model.vertices.clear();
     model.triangles.clear();
     model.faceRanges.clear();
@@ -97,21 +140,32 @@ std::string lowercaseExtension(const std::filesystem::path& path) {
     return result;
 }
 
-bool importShape(const std::filesystem::path& path, TopoDS_Shape& shape, std::string& error) {
+bool importShape(CADBridgeModel& model,
+                 const std::filesystem::path& path,
+                 const CADMeshOptions& options,
+                 TopoDS_Shape& shape,
+                 std::string& error) {
     const std::string extension = lowercaseExtension(path);
     const std::string nativePath = path.string();
+    reportProgress(model, CADLoadStageReading, -1.0);
 
     if (extension == ".step" || extension == ".stp") {
         // Use XDE for STEP so assembly instances and their nested placements
         // survive translation. The basic STEPControl reader is sufficient for
         // single parts, but can flatten product structure too early.
         STEPCAFControl_Reader reader;
+        if (!options.healShapes) {
+            // No ShapeProcess operations (FixShape, SplitAngle, ...): the
+            // geometry is used as exported.
+            reader.SetShapeProcessFlags(ShapeProcess::OperationsFlags());
+        }
         if (reader.ReadFile(nativePath.c_str()) != IFSelect_RetDone) {
             error = "Open CASCADE could not parse the STEP file.";
             return false;
         }
         Handle(TDocStd_Document) document = new TDocStd_Document("BinXCAF");
-        if (!reader.Transfer(document)) {
+        Handle(BridgeProgressIndicator) progress = new BridgeProgressIndicator(model, CADLoadStageTranslating, 0);
+        if (!reader.Transfer(document, progress->Start())) {
             error = "The STEP file did not contain any transferable shapes.";
             return false;
         }
@@ -130,7 +184,8 @@ bool importShape(const std::filesystem::path& path, TopoDS_Shape& shape, std::st
             error = "Open CASCADE could not parse the IGES file.";
             return false;
         }
-        if (reader.TransferRoots() <= 0) {
+        Handle(BridgeProgressIndicator) progress = new BridgeProgressIndicator(model, CADLoadStageTranslating, 0);
+        if (reader.TransferRoots(progress->Start()) <= 0) {
             error = "The IGES file did not contain any transferable shapes.";
             return false;
         }
@@ -164,7 +219,9 @@ bool importShape(const std::filesystem::path& path, TopoDS_Shape& shape, std::st
 CADBounds computeBounds(const TopoDS_Shape& shape) {
     CADBounds result{};
     Bnd_Box box;
-    BRepBndLib::AddOptimal(shape, box, Standard_False, Standard_False);
+    // Pole/control-point bounds: slightly loose but ~1000x cheaper than
+    // AddOptimal on NURBS-heavy assemblies. Tightened from the mesh later.
+    BRepBndLib::Add(shape, box, Standard_False);
     if (box.IsVoid()) {
         return result;
     }
@@ -202,12 +259,35 @@ void buildMesh(CADBridgeModel& model) {
     }
     model.faceRanges.reserve(model.faces.size());
 
+    // Reserve once. Calling reserve(size() + n) per face defeats the vector's
+    // geometric growth and reallocates + copies the whole buffer for every
+    // face, which is quadratic in the number of faces.
+    {
+        size_t nodeTotal = 0;
+        size_t triangleTotal = 0;
+        for (const TopoDS_Face& face : model.faces) {
+            TopLoc_Location location;
+            Handle(Poly_Triangulation) triangulation = BRep_Tool::Triangulation(face, location);
+            if (triangulation.IsNull()) continue;
+            nodeTotal += static_cast<size_t>(triangulation->NbNodes());
+            triangleTotal += static_cast<size_t>(triangulation->NbTriangles());
+        }
+        model.vertices.reserve(nodeTotal);
+        model.triangles.reserve(triangleTotal);
+    }
+
+    const size_t faceReportStep = std::max<size_t>(1, model.faces.size() / 50);
     for (size_t faceIndex = 0; faceIndex < model.faces.size(); ++faceIndex) {
+        if (faceIndex % faceReportStep == 0) {
+            reportProgress(model, CADLoadStageBuildingMesh,
+                           static_cast<double>(faceIndex) / std::max<size_t>(1, model.faces.size()),
+                           static_cast<uint32_t>(model.faces.size()));
+        }
         const TopoDS_Face& face = model.faces[faceIndex];
         CADFaceRange range{
             static_cast<uint32_t>(model.triangles.size()),
             0,
-            exactFaceArea(face)
+            -1.0 // exact area is computed on demand (CADBridgeModelFaceArea)
         };
         TopLoc_Location location;
         Handle(Poly_Triangulation) triangulation = BRep_Tool::Triangulation(face, location);
@@ -221,7 +301,6 @@ void buildMesh(CADBridgeModel& model) {
         const gp_Trsf transformation = location.Transformation();
         const bool reversed = face.Orientation() == TopAbs_REVERSED;
 
-        model.vertices.reserve(model.vertices.size() + static_cast<size_t>(triangulation->NbNodes()));
         for (Standard_Integer node = 1; node <= triangulation->NbNodes(); ++node) {
             gp_Pnt position = triangulation->Node(node);
             position.Transform(transformation);
@@ -238,7 +317,6 @@ void buildMesh(CADBridgeModel& model) {
             });
         }
 
-        model.triangles.reserve(model.triangles.size() + static_cast<size_t>(triangulation->NbTriangles()));
         for (Standard_Integer triangleIndex = 1; triangleIndex <= triangulation->NbTriangles(); ++triangleIndex) {
             Standard_Integer a, b, c;
             triangulation->Triangle(triangleIndex).Get(a, b, c);
@@ -309,14 +387,23 @@ void appendEdgeSamples(const TopoDS_Edge& edge, double deflection, std::vector<C
 
 void buildEdges(CADBridgeModel& model, double edgeDeflection) {
     model.edges.clear();
+    model.edgeShapes.clear();
     model.polylinePoints.clear();
 
     TopTools_IndexedMapOfShape edgeMap;
     TopExp::MapShapes(model.shape, TopAbs_EDGE, edgeMap);
     model.edges.reserve(static_cast<size_t>(edgeMap.Extent()));
+    model.edgeShapes.reserve(static_cast<size_t>(edgeMap.Extent()));
 
+    const Standard_Integer edgeReportStep = std::max(1, edgeMap.Extent() / 50);
     for (Standard_Integer index = 1; index <= edgeMap.Extent(); ++index) {
+        if (index % edgeReportStep == 0) {
+            reportProgress(model, CADLoadStageSamplingEdges,
+                           static_cast<double>(index) / std::max(1, edgeMap.Extent()),
+                           static_cast<uint32_t>(edgeMap.Extent()));
+        }
         const TopoDS_Edge edge = TopoDS::Edge(edgeMap(index));
+        model.edgeShapes.push_back(edge);
         const uint32_t firstPoint = static_cast<uint32_t>(model.polylinePoints.size());
         appendEdgeSamples(edge, edgeDeflection, model.polylinePoints);
         const uint32_t pointCount = static_cast<uint32_t>(model.polylinePoints.size()) - firstPoint;
@@ -326,7 +413,7 @@ void buildEdges(CADBridgeModel& model, double edgeDeflection) {
         model.edges.push_back({
             firstPoint,
             pointCount,
-            exactEdgeLength(edge),
+            -1.0, // exact length is computed on demand (CADBridgeModelEdgeLength)
             isCircular,
             exactDiameter
         });
@@ -347,21 +434,15 @@ CADModelStats computeStats(const CADBridgeModel& model) {
     stats.shellCount = countSubshapes(model.shape, TopAbs_SHELL);
     stats.solidCount = countSubshapes(model.shape, TopAbs_SOLID);
     stats.triangleCount = static_cast<uint32_t>(model.triangles.size());
-    for (const CADEdgePolyline& edge : model.edges) stats.totalEdgeLength += edge.exactLength;
-
-    GProp_GProps surfaceProperties;
-    BRepGProp::SurfaceProperties(model.shape, surfaceProperties, Standard_True, Standard_False);
-    stats.surfaceArea = surfaceProperties.Mass();
-    GProp_GProps volumeProperties;
-    BRepGProp::VolumeProperties(model.shape, volumeProperties, Standard_True, Standard_False, Standard_False);
-    stats.volume = volumeProperties.Mass();
+    // Total edge length, surface area and volume are not displayed anywhere
+    // and cost seconds on large assemblies; left at zero.
     return stats;
 }
 
 } // namespace
 
 CADMeshOptions CADBridgeDefaultMeshOptions(void) {
-    return {0.0, 0.35, 0.0, 1};
+    return {0.0, 0.15, 0.0, 1, 1.0, 1};
 }
 
 CADBridgeModel *CADBridgeModelCreate(void) {
@@ -395,7 +476,7 @@ CADBridgeStatus CADBridgeModelLoad(CADBridgeModel *model, const char *pathUTF8, 
         bool imported = false;
         {
             std::lock_guard<std::mutex> lock(importMutex);
-            imported = importShape(path, model->shape, importError);
+            imported = importShape(*model, path, options, model->shape, importError);
         }
         if (!imported) {
             const std::string extension = lowercaseExtension(path);
@@ -408,24 +489,48 @@ CADBridgeStatus CADBridgeModelLoad(CADBridgeModel *model, const char *pathUTF8, 
 
         model->bounds = computeBounds(model->shape);
         const double diagonal = std::max(boundsDiagonal(model->bounds), 1.0e-6);
+        // Large assemblies (thousands of faces) are viewed as a whole, so
+        // they can use a coarser mesh than a single part without looking worse.
+        const double faceCount = static_cast<double>(countSubshapes(model->shape, TopAbs_FACE));
+        const double complexity = std::clamp(faceCount / 2000.0, 1.0, 4.0);
+        const double deflectionScale = (options.linearDeflectionScale > 0.0 ? options.linearDeflectionScale : 1.0) * complexity;
         const double linearDeflection = options.linearDeflection > 0.0
-            ? options.linearDeflection : std::max(diagonal * 0.001, 1.0e-6);
+            ? options.linearDeflection : std::max(diagonal * 0.0004 * deflectionScale, 1.0e-6);
         const double angularDeflection = options.angularDeflectionRadians > 0.0
-            ? options.angularDeflectionRadians : 0.35;
+            ? options.angularDeflectionRadians : std::min(0.15 * complexity, 0.35);
         const double edgeDeflection = options.edgeDeflection > 0.0
             ? options.edgeDeflection : linearDeflection;
 
-        BRepMesh_IncrementalMesh mesher(model->shape,
-                                        linearDeflection,
-                                        Standard_False,
-                                        angularDeflection,
-                                        options.parallel ? Standard_True : Standard_False);
+        IMeshTools_Parameters meshParameters;
+        meshParameters.Deflection = linearDeflection;
+        meshParameters.Angle = angularDeflection;
+        meshParameters.Relative = Standard_False;
+        meshParameters.InParallel = options.parallel ? Standard_True : Standard_False;
+        Handle(BridgeProgressIndicator) meshProgress =
+            new BridgeProgressIndicator(*model, CADLoadStageMeshing, static_cast<uint32_t>(faceCount));
+        BRepMesh_IncrementalMesh mesher(model->shape, meshParameters, meshProgress->Start());
         if (!mesher.IsDone()) {
             return fail(*model, CADBridgeStatusMeshingFailed, "Open CASCADE could not tessellate the imported shape.");
         }
 
         buildMesh(*model);
         buildEdges(*model, edgeDeflection);
+        if (!model->vertices.empty()) {
+            CADBounds tight{};
+            tight.minimum = {model->vertices[0].x, model->vertices[0].y, model->vertices[0].z};
+            tight.maximum = tight.minimum;
+            for (const CADVertex& v : model->vertices) {
+                tight.minimum.x = std::min(tight.minimum.x, static_cast<double>(v.x));
+                tight.minimum.y = std::min(tight.minimum.y, static_cast<double>(v.y));
+                tight.minimum.z = std::min(tight.minimum.z, static_cast<double>(v.z));
+                tight.maximum.x = std::max(tight.maximum.x, static_cast<double>(v.x));
+                tight.maximum.y = std::max(tight.maximum.y, static_cast<double>(v.y));
+                tight.maximum.z = std::max(tight.maximum.z, static_cast<double>(v.z));
+            }
+            tight.isValid = 1;
+            model->bounds = tight;
+        }
+        reportProgress(*model, CADLoadStageFinishing, -1.0);
         model->stats = computeStats(*model);
         if (model->triangles.empty()) {
             return fail(*model, CADBridgeStatusMeshingFailed, "The imported shape did not produce any display triangles.");
@@ -492,6 +597,44 @@ CADBounds CADBridgeModelBounds(const CADBridgeModel *model) {
 
 CADModelStats CADBridgeModelStats(const CADBridgeModel *model) {
     return model ? model->stats : CADModelStats{};
+}
+
+void CADBridgeModelSetProgressCallback(CADBridgeModel *model, CADBridgeProgressCallback callback, void *context) {
+    if (!model) return;
+    std::lock_guard<std::mutex> lock(model->progressMutex);
+    model->progressCallback = callback;
+    model->progressContext = context;
+    model->lastFraction = -2.0;
+}
+
+CADBridgeStatus CADBridgeModelFaceArea(CADBridgeModel *model, uint32_t faceIndex, double *outArea) {
+    if (!model || !outArea) return CADBridgeStatusInvalidArgument;
+    if (faceIndex >= model->faces.size()) return CADBridgeStatusOutOfRange;
+    CADFaceRange& range = model->faceRanges[faceIndex];
+    if (range.exactArea < 0.0) {
+        try {
+            range.exactArea = exactFaceArea(model->faces[faceIndex]);
+        } catch (const Standard_Failure&) {
+            range.exactArea = 0.0;
+        }
+    }
+    *outArea = range.exactArea;
+    return CADBridgeStatusOK;
+}
+
+CADBridgeStatus CADBridgeModelEdgeLength(CADBridgeModel *model, uint32_t edgeIndex, double *outLength) {
+    if (!model || !outLength) return CADBridgeStatusInvalidArgument;
+    if (edgeIndex >= model->edgeShapes.size()) return CADBridgeStatusOutOfRange;
+    CADEdgePolyline& edge = model->edges[edgeIndex];
+    if (edge.exactLength < 0.0) {
+        try {
+            edge.exactLength = exactEdgeLength(model->edgeShapes[edgeIndex]);
+        } catch (const Standard_Failure&) {
+            edge.exactLength = 0.0;
+        }
+    }
+    *outLength = edge.exactLength;
+    return CADBridgeStatusOK;
 }
 
 CADBridgeStatus CADBridgeModelMeasureFaceDistance(CADBridgeModel *model,

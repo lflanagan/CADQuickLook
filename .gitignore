@@ -11,3 +11,9 @@ dist/
 *.xcuserstate
 xcuserdata/
 .swiftpm/
+# Signing and update keys never belong in the repository.
+*.key
+*.pem
+*.cer
+.env
+.env.*

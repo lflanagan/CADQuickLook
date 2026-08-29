@@ -14,9 +14,13 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
         didSet { cubeView.onSnap = onSnap }
     }
     var onProjectionChange: ((CADCameraProjection) -> Void)?
+    /// 2D drawings have a fixed top-down view, so the cube is hidden.
+    var isPlanar = false {
+        didSet { cubeView.isHidden = isPlanar }
+    }
 
-    var viewDirection = SCNVector3(1, -1, 1) {
-        didSet { cubeView.viewDirection = viewDirection }
+    var cameraOrientation = CADSceneFactory.cameraOrientation(offset: CADSceneFactory.defaultCameraOffset) {
+        didSet { cubeView.cameraOrientation = cameraOrientation }
     }
 
     private let cubeView = CADOrientationCubeSceneView(frame: .zero, options: nil)
@@ -40,14 +44,14 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
             heightAnchor.constraint(equalToConstant: 184),
             cubeView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
             cubeView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
-            cubeView.topAnchor.constraint(equalTo: topAnchor, constant: 4),
-            cubeView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -30),
+            cubeView.topAnchor.constraint(equalTo: topAnchor, constant: 30),
+            cubeView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
             viewsButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
-            viewsButton.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -5),
+            viewsButton.topAnchor.constraint(equalTo: topAnchor, constant: 5),
             viewsButton.widthAnchor.constraint(equalToConstant: 32),
             viewsButton.heightAnchor.constraint(equalToConstant: 24)
         ])
-        cubeView.viewDirection = viewDirection
+        cubeView.cameraOrientation = cameraOrientation
     }
 
     required init?(coder: NSCoder) { nil }
@@ -99,6 +103,16 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
             menu.addItem(item)
         }
         menu.addItem(.separator())
+        menu.addItem(.sectionHeader(title: "Units"))
+        let selectedUnit = CADPreferences.lengthUnit
+        for unit in CADLengthUnit.allCases {
+            let item = NSMenuItem(title: "\(unit.title) (\(unit.symbol))", action: #selector(selectLengthUnit(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = "unit:\(unit.rawValue)"
+            item.state = unit == selectedUnit ? .on : .off
+            menu.addItem(item)
+        }
+        menu.addItem(.separator())
         menu.addItem(.sectionHeader(title: "Navigation Controls"))
         let selectedPreset = CADPreferences.navigationPreset
         for preset in CADNavigationPreset.allCases {
@@ -116,6 +130,7 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         let selectedPreset = CADPreferences.navigationPreset
         let selectedProjection = CADPreferences.cameraProjection
+        let selectedUnit = CADPreferences.lengthUnit
         onProjectionChange?(selectedProjection)
         for item in menu.items {
             guard let identifier = item.representedObject as? String,
@@ -126,6 +141,9 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
             } else if identifier.hasPrefix("projection:"),
                       let projection = CADCameraProjection(rawValue: rawValue) {
                 item.state = projection == selectedProjection ? .on : .off
+            } else if identifier.hasPrefix("unit:"),
+                      let unit = CADLengthUnit(rawValue: rawValue) {
+                item.state = unit == selectedUnit ? .on : .off
             }
         }
     }
@@ -145,6 +163,10 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
                   let projection = CADCameraProjection(rawValue: rawValue) {
             CADPreferences.setCameraProjection(projection)
             onProjectionChange?(projection)
+        } else if identifier.hasPrefix("unit:"),
+                  let rawValue = identifier.split(separator: ":", maxSplits: 1).last.map(String.init),
+                  let unit = CADLengthUnit(rawValue: rawValue) {
+            CADPreferences.setLengthUnit(unit)
         }
         sender.selectItem(at: 0)
     }
@@ -165,6 +187,14 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
         viewsButton.selectItem(at: 0)
     }
 
+    @objc private func selectLengthUnit(_ sender: NSMenuItem) {
+        guard let identifier = sender.representedObject as? String,
+              let rawValue = identifier.split(separator: ":", maxSplits: 1).last.map(String.init),
+              let unit = CADLengthUnit(rawValue: rawValue) else { return }
+        CADPreferences.setLengthUnit(unit)
+        viewsButton.selectItem(at: 0)
+    }
+
     @objc private func selectCameraProjection(_ sender: NSMenuItem) {
         guard let identifier = sender.representedObject as? String,
               let rawValue = identifier.split(separator: ":", maxSplits: 1).last.map(String.init),
@@ -178,7 +208,9 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
 @MainActor
 private final class CADOrientationCubeSceneView: SCNView {
     var onSnap: ((CADStandardView) -> Void)?
-    var viewDirection = SCNVector3(1, -1, 1) { didSet { updateCamera() } }
+    var cameraOrientation = CADSceneFactory.cameraOrientation(offset: CADSceneFactory.defaultCameraOffset) {
+        didSet { updateCamera() }
+    }
 
     private let cameraNode = SCNNode()
     private let cubeCenter = SCNVector3(0.67, 0.67, 0.67)
@@ -220,12 +252,6 @@ private final class CADOrientationCubeSceneView: SCNView {
         cameraNode.camera?.usesOrthographicProjection = true
         cameraNode.camera?.orthographicScale = 2.55
         cameraNode.camera?.automaticallyAdjustsZRange = true
-        let target = SCNNode()
-        target.position = cubeCenter
-        scene.rootNode.addChildNode(target)
-        let lookAt = SCNLookAtConstraint(target: target)
-        lookAt.isGimbalLockEnabled = true
-        cameraNode.constraints = [lookAt]
         scene.rootNode.addChildNode(cameraNode)
         pointOfView = cameraNode
         updateCamera()
@@ -243,19 +269,24 @@ private final class CADOrientationCubeSceneView: SCNView {
         cubeNode.categoryBitMask = 1
         scene.rootNode.addChildNode(cubeNode)
 
-        addFace("Top", view: .top, position: SCNVector3(0.67, 0.67, 1.36), euler: SCNVector3Zero, to: scene)
-        addFace("Bottom", view: .bottom, position: SCNVector3(0.67, 0.67, -0.02), euler: SCNVector3(0, Float.pi, 0), to: scene)
-        addFace("Front", view: .front, position: SCNVector3(0.67, -0.02, 0.67), euler: SCNVector3(Float.pi / 2, 0, 0), to: scene)
-        addFace("Back", view: .back, position: SCNVector3(0.67, 1.36, 0.67), euler: SCNVector3(-Float.pi / 2, 0, 0), to: scene)
-        addFace("Right", view: .right, position: SCNVector3(1.36, 0.67, 0.67), euler: SCNVector3(0, Float.pi / 2, 0), to: scene)
-        addFace("Left", view: .left, position: SCNVector3(-0.02, 0.67, 0.67), euler: SCNVector3(0, -Float.pi / 2, 0), to: scene)
+        // Each face's (right, up, normal) matches the standard view that looks at
+        // it, so the labels read upright with Z up (Top/Bottom use ±Y as up).
+        let x = SIMD3<Float>(1, 0, 0), y = SIMD3<Float>(0, 1, 0), z = SIMD3<Float>(0, 0, 1)
+        addFace("Top", view: .top, position: SCNVector3(0.67, 0.67, 1.36), right: x, up: y, normal: z, to: scene)
+        addFace("Bottom", view: .bottom, position: SCNVector3(0.67, 0.67, -0.02), right: x, up: -y, normal: -z, to: scene)
+        addFace("Front", view: .front, position: SCNVector3(0.67, -0.02, 0.67), right: x, up: z, normal: -y, to: scene)
+        addFace("Back", view: .back, position: SCNVector3(0.67, 1.36, 0.67), right: -x, up: z, normal: y, to: scene)
+        addFace("Right", view: .right, position: SCNVector3(1.36, 0.67, 0.67), right: y, up: z, normal: x, to: scene)
+        addFace("Left", view: .left, position: SCNVector3(-0.02, 0.67, 0.67), right: -y, up: z, normal: -x, to: scene)
     }
 
     private func addFace(
         _ title: String,
         view: CADStandardView,
         position: SCNVector3,
-        euler: SCNVector3,
+        right: SIMD3<Float>,
+        up: SIMD3<Float>,
+        normal: SIMD3<Float>,
         to scene: SCNScene
     ) {
         let plane = SCNPlane(width: 1.12, height: 1.12)
@@ -268,7 +299,7 @@ private final class CADOrientationCubeSceneView: SCNView {
         let node = SCNNode(geometry: plane)
         node.name = "view:\(view.rawValue)"
         node.position = position
-        node.eulerAngles = euler
+        node.simdOrientation = simd_quatf(simd_float3x3(columns: (right, up, normal)))
         node.categoryBitMask = 2
         scene.rootNode.addChildNode(node)
     }
@@ -330,18 +361,12 @@ private final class CADOrientationCubeSceneView: SCNView {
         return image
     }
 
+    /// Mirrors the main camera's orientation (including roll) so the cube
+    /// always shows exactly how the model is oriented on screen.
     private func updateCamera() {
-        let direction = normalized(viewDirection)
-        cameraNode.position = SCNVector3(
-            cubeCenter.x + direction.x * 5,
-            cubeCenter.y + direction.y * 5,
-            cubeCenter.z + direction.z * 5
-        )
+        let backward = cameraOrientation.act(SIMD3<Float>(0, 0, 1))
+        cameraNode.simdOrientation = cameraOrientation
+        cameraNode.simdPosition = cubeCenter.simdVector + backward * 5
         setNeedsDisplay(bounds)
     }
-}
-
-private func normalized(_ vector: SCNVector3) -> SCNVector3 {
-    let length = max(sqrt(vector.x * vector.x + vector.y * vector.y + vector.z * vector.z), 0.0001)
-    return SCNVector3(vector.x / length, vector.y / length, vector.z / length)
 }

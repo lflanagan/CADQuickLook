@@ -12,17 +12,31 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>$(PRODUCT_NAME)</string>
+	<key>CADAppGroup</key>
+	<string>$(CAD_APP_GROUP)</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>0.2.0</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright © 2026 Liam Flanagan. MIT License.</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.graphics-design</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>$(MACOSX_DEPLOYMENT_TARGET)</string>
 	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://github.com/lflanagan/CADQuickLook/releases/latest/download/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>GZPFfvBagKlhpBfgSv/YowlbWVUq1S5QSTYTF98gqSI=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
+	<key>SUVerifyUpdateBeforeExtraction</key>
 	<true/>
 	<key>CFBundleDocumentTypes</key>
 	<array>
@@ -36,11 +50,31 @@
 				<string>com.liamflanagan.cad.iges</string>
 				<string>com.liamflanagan.cad.brep</string>
 				<string>com.liamflanagan.cad.stl</string>
+				<string>public.standard-tesselated-geometry-format</string>
+				<string>com.liamflanagan.cad.dxf</string>
+				<string>org.libreoffice.dxf-document</string>
+				<string>com.autodesk.dxf</string>
 			</array>
 		</dict>
 	</array>
 	<key>UTExportedTypeDeclarations</key>
 	<array>
+		<dict>
+			<key>UTTypeConformsTo</key><array><string>public.data</string><string>public.2d-content</string></array>
+			<key>UTTypeDescription</key><string>DXF Drawing</string>
+			<key>UTTypeIdentifier</key><string>com.liamflanagan.cad.dxf</string>
+			<key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>dxf</string></array></dict>
+		</dict>
+		<dict>
+			<!-- LibreOffice only *imports* this identifier and makes it conform to
+			     public.image, which routes .dxf to the system image thumbnailer
+			     (which fails). An exported declaration outranks imported ones, so
+			     re-declare it here as plain data. -->
+			<key>UTTypeConformsTo</key><array><string>public.data</string><string>public.2d-content</string></array>
+			<key>UTTypeDescription</key><string>DXF Drawing</string>
+			<key>UTTypeIdentifier</key><string>org.libreoffice.dxf-document</string>
+			<key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>dxf</string></array><key>public.mime-type</key><array><string>image/vnd.dxf</string></array></dict>
+		</dict>
 		<dict>
 			<key>UTTypeConformsTo</key><array><string>public.data</string><string>public.3d-content</string></array>
 			<key>UTTypeDescription</key><string>STEP CAD Model</string>
@@ -60,7 +94,7 @@
 			<key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>brep</string></array></dict>
 		</dict>
 		<dict>
-			<key>UTTypeConformsTo</key><array><string>public.data</string><string>public.3d-content</string></array>
+			<key>UTTypeConformsTo</key><array><string>public.standard-tesselated-geometry-format</string><string>public.data</string><string>public.3d-content</string></array>
 			<key>UTTypeDescription</key><string>STL Mesh</string>
 			<key>UTTypeIdentifier</key><string>com.liamflanagan.cad.stl</string>
 			<key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>stl</string></array></dict>

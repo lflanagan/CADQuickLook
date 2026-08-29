@@ -12,12 +12,14 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>$(PRODUCT_NAME)</string>
+	<key>CADAppGroup</key>
+	<string>$(CAD_APP_GROUP)</string>
 	<key>CFBundlePackageType</key>
 	<string>XPC!</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>0.2.0</string>
 	<key>NSExtension</key>
 	<dict>
 		<key>NSExtensionAttributes</key>
@@ -28,11 +30,18 @@
 				<string>com.liamflanagan.cad.iges</string>
 				<string>com.liamflanagan.cad.brep</string>
 				<string>com.liamflanagan.cad.stl</string>
+				<string>public.standard-tesselated-geometry-format</string>
+				<string>com.liamflanagan.cad.dxf</string>
+				<string>org.libreoffice.dxf-document</string>
+				<string>com.autodesk.dxf</string>
 			</array>
-			<key>QLThumbnailMinimumDimension</key><integer>32</integer>
+			<key>QLThumbnailMinimumDimension</key>
+			<integer>32</integer>
 		</dict>
-		<key>NSExtensionPointIdentifier</key><string>com.apple.quicklook.thumbnail</string>
-		<key>NSExtensionPrincipalClass</key><string>$(PRODUCT_MODULE_NAME).ThumbnailProvider</string>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.quicklook.thumbnail</string>
+		<key>NSExtensionPrincipalClass</key>
+		<string>$(PRODUCT_MODULE_NAME).ThumbnailProvider</string>
 	</dict>
 </dict>
 </plist>
