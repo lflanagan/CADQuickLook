@@ -74,7 +74,8 @@ sed "s/\$(CAD_APP_GROUP)/$APP_GROUP/g" "$ROOT_DIR/Extensions/Extension.entitleme
 # ad-hoc-signed Open CASCADE dylibs. The release re-signs every dylib with the
 # same Team ID, so keep the hardened runtime's library validation on.
 for entitlements in "$STAGE_DIR/app.entitlements" "$STAGE_DIR/extension.entitlements"; do
-  /usr/bin/plutil -remove 'com.apple.security.cs.disable-library-validation' "$entitlements"
+  # PlistBuddy, not plutil: plutil reads the dots in the key as a key path.
+  /usr/libexec/PlistBuddy -c 'Delete :com.apple.security.cs.disable-library-validation' "$entitlements" >/dev/null 2>&1 || true
 done
 
 /usr/bin/ditto "$BUILT_APP" "$APP_BUNDLE"
