@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import simd
 
@@ -11,6 +12,24 @@ struct DXFEdge {
     /// Analytic length where the entity has one (lines, arcs, bulge
     /// polylines); polyline length otherwise.
     var length: Double
+    /// Resolved layer/entity colour (RGB 0...1), nil for the default.
+    var color: SIMD3<Float>? = nil
+}
+
+/// A TEXT/MTEXT entity, in drawing units.
+struct DXFText {
+    var text: String
+    /// Insertion point after alignment: the point the anchor refers to.
+    var position: SIMD2<Double>
+    /// Cap height.
+    var height: Double
+    /// Radians, counter-clockwise.
+    var rotation: Double
+    /// 0 left, 1 centre, 2 right.
+    var horizontalAnchor: Int
+    /// 0 baseline/bottom, 1 middle, 2 top.
+    var verticalAnchor: Int
+    var color: SIMD3<Float>? = nil
 }
 
 /// Minimal ASCII DXF reader: LINE, CIRCLE, ARC, LWPOLYLINE, POLYLINE/VERTEX,
@@ -18,8 +37,12 @@ struct DXFEdge {
 /// are ignored. Everything is projected onto the XY plane.
 struct DXFDrawing {
     private(set) var edges: [DXFEdge] = []
+    private(set) var texts: [DXFText] = []
     /// Multiplier from drawing units to millimetres, from $INSUNITS (1 when unset).
     private(set) var unitScaleToMillimeters: Double = 1
+    /// Layer name → colour, from the TABLES section.
+    private var layerColors: [String: SIMD3<Float>] = [:]
+    private static let maximumTexts = 5_000
 
     enum ParseError: LocalizedError {
         case unreadable
@@ -97,6 +120,24 @@ struct DXFDrawing {
                     unitScaleToMillimeters = Self.unitScale(insunits: code)
                 }
                 index += 1
+            case "TABLES":
+                if pair.code == 0, pair.value == "LAYER" {
+                    index += 1
+                    var name: String?
+                    var color: SIMD3<Float>?
+                    while index < pairs.count, pairs[index].code != 0 {
+                        switch pairs[index].code {
+                        case 2: name = pairs[index].value
+                        case 62: if color == nil, let aci = Int(pairs[index].value) { color = Self.color(aci: abs(aci)) }
+                        case 420: if let rgb = Int(pairs[index].value) { color = Self.color(trueColor: rgb) }
+                        default: break
+                        }
+                        index += 1
+                    }
+                    if let name, let color { layerColors[name] = color }
+                } else {
+                    index += 1
+                }
             case "BLOCKS":
                 if pair.code == 0, pair.value == "BLOCK" {
                     index += 1
@@ -215,6 +256,9 @@ struct DXFDrawing {
         var scale = SIMD2<Double>(1, 1)
         var rotation = 0.0
         var base = SIMD2<Double>(0, 0)
+        /// Colour of the enclosing INSERT, for BYBLOCK entities and layer "0"
+        /// inside blocks.
+        var blockColor: SIMD3<Float>?
         static let identity = Transform()
 
         func apply(_ p: SIMD2<Double>) -> SIMD2<Double> {
@@ -226,12 +270,25 @@ struct DXFDrawing {
         var isUniform: Bool { abs(abs(scale.x) - abs(scale.y)) < 1e-9 }
     }
 
+    /// Entity colour: true colour (420), else ACI (62): 0 = BYBLOCK, 256 or
+    /// absent = BYLAYER (layer "0" inside a block also takes the block's colour).
+    private func color(of entity: Entity, transform: Transform) -> SIMD3<Float>? {
+        if let rgb = entity.string(420).flatMap(Int.init) { return Self.color(trueColor: rgb) }
+        let aci = entity.string(62).flatMap(Int.init) ?? 256
+        if aci == 0 { return transform.blockColor }
+        if aci > 0, aci < 256 { return Self.color(aci: aci) }
+        let layer = entity.string(8) ?? "0"
+        if layer == "0", let blockColor = transform.blockColor { return blockColor }
+        return layerColors[layer]
+    }
+
     private mutating func append(_ entity: Entity, transform: Transform, depth: Int) {
         // Budget against block-reference fan-out (a block inserting itself N times
         // is N^depth entities) and absurd sample counts.
         guard edges.count < Self.maximumEdges, pointCount < Self.maximumPoints else { return }
         // Entities with a flipped extrusion direction (OCS Z = -1) are mirrored in X.
         let mirrored = entity.value(230, default: 1) < 0
+        let entityColor = color(of: entity, transform: transform)
         func emit(_ points: [SIMD2<Double>], circular: Bool = false, diameter: Double = 0, length: Double? = nil) {
             guard points.count > 1, points.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else { return }
             var mapped = points
@@ -246,7 +303,8 @@ struct DXFDrawing {
                 points: mapped,
                 isCircular: keepCircular,
                 diameter: keepCircular ? diameter * transform.lengthScale : 0,
-                length: exact
+                length: exact,
+                color: entityColor
             ))
         }
 
@@ -339,12 +397,283 @@ struct DXFDrawing {
             composed.scale = nested.scale * outer.scale
             composed.rotation = nested.rotation + outer.rotation
             composed.base = block.base
+            composed.blockColor = entityColor ?? transform.blockColor
             for child in block.entities {
                 append(child, transform: composed, depth: depth + 1)
             }
 
+        case "DIMENSION":
+            // A dimension's lines, arrows and text live in its anonymous block
+            // (*D12), already in drawing coordinates.
+            guard depth < 8, let name = entity.string(2), let block = blocks[name] else { return }
+            var composed = transform
+            composed.blockColor = entityColor ?? transform.blockColor
+            for child in block.entities {
+                append(child, transform: composed, depth: depth + 1)
+            }
+
+        case "TEXT", "ATTRIB":
+            appendText(entity, transform: transform, mirrored: mirrored, color: entityColor)
+
+        case "MTEXT":
+            appendMText(entity, transform: transform, color: entityColor)
+
+        case "HATCH":
+            for loop in Self.hatchBoundaries(entity) {
+                emit(loop)
+            }
+
         default:
             break
+        }
+    }
+
+    // MARK: - Text
+
+    private mutating func appendText(_ entity: Entity, transform: Transform, mirrored: Bool, color: SIMD3<Float>?) {
+        guard texts.count < Self.maximumTexts, var text = entity.string(1), !text.isEmpty else { return }
+        text = Self.plainText(text)
+        let height = entity.value(40) * transform.lengthScale
+        guard height > 0, height.isFinite else { return }
+        let horizontal = Int(entity.value(72))
+        let vertical = Int(entity.value(73))
+        // Left-baseline text anchors at 10/20; every other justification at 11/21.
+        let aligned = horizontal != 0 || vertical != 0
+        var point = aligned
+            ? SIMD2<Double>(entity.value(11), entity.value(21))
+            : SIMD2<Double>(entity.value(10), entity.value(20))
+        if mirrored { point.x = -point.x }
+        let anchorH: Int = switch horizontal {
+        case 1, 4: 1        // centre, middle
+        case 2: 2           // right
+        case 3, 5: 1        // aligned / fit: treat as centred between the points
+        default: 0
+        }
+        let anchorV: Int = switch vertical {
+        case 2: 1           // middle
+        case 3: 2           // top
+        default: 0          // baseline / bottom
+        }
+        texts.append(DXFText(
+            text: text,
+            position: transform.apply(point),
+            height: height,
+            rotation: entity.value(50) * .pi / 180 + transform.rotation,
+            horizontalAnchor: anchorH,
+            verticalAnchor: anchorV,
+            color: color
+        ))
+    }
+
+    private mutating func appendMText(_ entity: Entity, transform: Transform, color: SIMD3<Float>?) {
+        guard texts.count < Self.maximumTexts else { return }
+        // Long MTEXT is split into 250-character chunks in code 3, then code 1.
+        var raw = entity.pairs.filter { $0.code == 3 }.map(\.value).joined()
+        raw += entity.string(1) ?? ""
+        let text = Self.plainText(raw)
+        guard !text.isEmpty else { return }
+        let height = entity.value(40) * transform.lengthScale
+        guard height > 0, height.isFinite else { return }
+        let attachment = Int(entity.value(71, default: 1))
+        let anchorH = (attachment - 1) % 3          // 0 left, 1 centre, 2 right
+        let row = (attachment - 1) / 3               // 0 top, 1 middle, 2 bottom
+        let anchorV = row == 0 ? 2 : (row == 1 ? 1 : 0)
+        // Rotation: the X-axis direction vector (11/21) wins over code 50.
+        var rotation = entity.value(50) * .pi / 180
+        let axis = SIMD2<Double>(entity.value(11), entity.value(21))
+        if simd_length(axis) > 1e-9 { rotation = atan2(axis.y, axis.x) }
+        texts.append(DXFText(
+            text: text,
+            position: transform.apply(SIMD2<Double>(entity.value(10), entity.value(20))),
+            height: height,
+            rotation: rotation + transform.rotation,
+            horizontalAnchor: anchorH,
+            verticalAnchor: anchorV,
+            color: color
+        ))
+    }
+
+    /// Strips MTEXT inline formatting (\P paragraph, \f font, \H height, {}
+    /// groups, %%c diameter...) down to displayable text.
+    private static func plainText(_ raw: String) -> String {
+        var result = ""
+        var index = raw.startIndex
+        while index < raw.endIndex {
+            let character = raw[index]
+            if character == "\\", raw.index(after: index) < raw.endIndex {
+                let code = raw[raw.index(after: index)]
+                index = raw.index(index, offsetBy: 2)
+                switch code {
+                case "P": result += "\n"
+                case "~": result += " "
+                case "\\", "{", "}": result.append(code)
+                case "f", "F", "H", "W", "C", "T", "Q", "A", "p", "L", "l", "O", "o", "K", "k", "S":
+                    // Parameterised codes run to the next ';' (\S stacked text keeps its content).
+                    if let end = raw[index...].firstIndex(of: ";") {
+                        if code == "S" {
+                            result += raw[index..<end].replacingOccurrences(of: "^", with: "/").replacingOccurrences(of: "#", with: "/")
+                        }
+                        index = raw.index(after: end)
+                    }
+                default: break
+                }
+                continue
+            }
+            if character == "{" || character == "}" {
+                index = raw.index(after: index)
+                continue
+            }
+            if character == "%", raw.distance(from: index, to: raw.endIndex) >= 3, raw[raw.index(after: index)] == "%" {
+                let code = raw[raw.index(index, offsetBy: 2)]
+                index = raw.index(index, offsetBy: 3)
+                switch code {
+                case "c", "C": result += "⌀"
+                case "d", "D": result += "°"
+                case "p", "P": result += "±"
+                case "%": result += "%"
+                default: break
+                }
+                continue
+            }
+            result.append(character)
+            index = raw.index(after: index)
+        }
+        return result.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - Hatch
+
+    /// Boundary loops of a HATCH as polylines (no fill).
+    private static func hatchBoundaries(_ entity: Entity) -> [[SIMD2<Double>]] {
+        var loops: [[SIMD2<Double>]] = []
+        let pairs = entity.pairs
+        var i = 0
+        func next(_ code: Int) -> Double? {
+            while i < pairs.count {
+                let pair = pairs[i]
+                i += 1
+                if pair.code == code { return Double(pair.value) }
+            }
+            return nil
+        }
+        // Skip to the boundary-path count.
+        guard let pathCount = next(91) else { return [] }
+        for _ in 0..<min(Int(pathCount), 10_000) {
+            guard let flags = next(92) else { break }
+            let isPolyline = Int(flags) & 2 != 0
+            if isPolyline {
+                let hasBulge = (next(72) ?? 0) != 0
+                guard let count = next(93) else { break }
+                var vertices: [(SIMD2<Double>, Double)] = []
+                for _ in 0..<min(Int(count), 100_000) {
+                    guard let x = next(10), let y = next(20) else { break }
+                    let bulge = hasBulge ? (next(42) ?? 0) : 0
+                    vertices.append((SIMD2<Double>(x, y), bulge))
+                }
+                var points: [SIMD2<Double>] = []
+                for (index, (a, bulge)) in vertices.enumerated() {
+                    let b = vertices[(index + 1) % vertices.count].0
+                    if abs(bulge) < 1e-12 || simd_length(b - a) == 0 {
+                        points.append(a)
+                    } else {
+                        let theta = 4 * atan(bulge)
+                        let chord = simd_length(b - a)
+                        let radius = chord / (2 * sin(abs(theta) / 2))
+                        let midpoint = (a + b) / 2
+                        let normal = SIMD2<Double>(-(b.y - a.y), b.x - a.x) / chord
+                        let sagitta = abs(bulge) * chord / 2
+                        let center = midpoint + normal * (radius - sagitta) * (bulge > 0 ? 1 : -1)
+                        points.append(contentsOf: arcPoints(center: center, radius: radius,
+                                                            start: atan2(a.y - center.y, a.x - center.x), sweep: theta).dropLast())
+                    }
+                }
+                if let first = points.first { points.append(first) }
+                loops.append(points)
+            } else {
+                guard let edgeCount = next(93) else { break }
+                var points: [SIMD2<Double>] = []
+                for _ in 0..<min(Int(edgeCount), 100_000) {
+                    guard let type = next(72) else { break }
+                    switch Int(type) {
+                    case 1:
+                        guard let x0 = next(10), let y0 = next(20), let x1 = next(11), let y1 = next(21) else { break }
+                        points.append(SIMD2<Double>(x0, y0))
+                        points.append(SIMD2<Double>(x1, y1))
+                    case 2:
+                        guard let cx = next(10), let cy = next(20), let radius = next(40),
+                              let start = next(50), let end = next(51) else { break }
+                        let ccw = (next(73) ?? 1) != 0
+                        var sweep = (end - start) * .pi / 180
+                        if sweep <= 0 { sweep += 2 * .pi }
+                        if !ccw { sweep = -sweep }
+                        points.append(contentsOf: arcPoints(center: SIMD2<Double>(cx, cy), radius: radius,
+                                                            start: start * .pi / 180, sweep: sweep))
+                    case 3:
+                        guard let cx = next(10), let cy = next(20), let mx = next(11), let my = next(21),
+                              let ratio = next(40), let start = next(50), let end = next(51) else { break }
+                        let ccw = (next(73) ?? 1) != 0
+                        let major = SIMD2<Double>(mx, my)
+                        let minor = SIMD2<Double>(-major.y, major.x) * ratio
+                        var sweep = (end - start) * .pi / 180
+                        if sweep <= 0 { sweep += 2 * .pi }
+                        if !ccw { sweep = -sweep }
+                        let steps = max(8, Int(abs(sweep) / (.pi / 24)))
+                        for step in 0...steps {
+                            let t = start * .pi / 180 + sweep * Double(step) / Double(steps)
+                            points.append(SIMD2<Double>(cx, cy) + major * cos(t) + minor * sin(t))
+                        }
+                    case 4:
+                        // Spline edge: degree, rational, periodic, knot count, control count, then knots/controls.
+                        _ = next(94); _ = next(73); _ = next(74)
+                        let knotCount = Int(next(95) ?? 0)
+                        let controlCount = Int(next(96) ?? 0)
+                        for _ in 0..<min(knotCount, 100_000) { _ = next(40) }
+                        for _ in 0..<min(controlCount, 100_000) {
+                            guard let x = next(10), let y = next(20) else { break }
+                            points.append(SIMD2<Double>(x, y))
+                        }
+                    default:
+                        break
+                    }
+                }
+                if points.count > 1 { loops.append(points) }
+            }
+            // Skip this path's source-boundary object handles.
+            if let count = next(97) { for _ in 0..<min(Int(count), 100_000) { _ = next(330) } }
+        }
+        return loops
+    }
+
+    // MARK: - Colours
+
+    private static func color(trueColor rgb: Int) -> SIMD3<Float> {
+        SIMD3<Float>(Float((rgb >> 16) & 0xFF), Float((rgb >> 8) & 0xFF), Float(rgb & 0xFF)) / 255
+    }
+
+    /// AutoCAD Color Index → RGB. 7 is "white/black" (foreground), drawn white here.
+    private static func color(aci: Int) -> SIMD3<Float>? {
+        switch aci {
+        case 1: return SIMD3<Float>(1, 0, 0)
+        case 2: return SIMD3<Float>(1, 1, 0)
+        case 3: return SIMD3<Float>(0, 1, 0)
+        case 4: return SIMD3<Float>(0, 1, 1)
+        case 5: return SIMD3<Float>(0.25, 0.45, 1)
+        case 6: return SIMD3<Float>(1, 0, 1)
+        case 7: return nil
+        case 8: return SIMD3<Float>(repeating: 0.5)
+        case 9: return SIMD3<Float>(repeating: 0.75)
+        case 10...249:
+            let group = (aci - 10) / 10
+            let step = (aci - 10) % 10
+            let hue = Double(group) * 15 / 360
+            let value = [1.0, 0.65, 0.5, 0.35, 0.2][step / 2]
+            let saturation = step % 2 == 0 ? 1.0 : 0.5
+            let color = NSColor(calibratedHue: hue, saturation: saturation, brightness: value, alpha: 1)
+            return SIMD3<Float>(Float(color.redComponent), Float(color.greenComponent), Float(color.blueComponent))
+        case 250...255:
+            return SIMD3<Float>(repeating: Float(0.2 + 0.16 * Double(aci - 250)))
+        default:
+            return nil
         }
     }
 

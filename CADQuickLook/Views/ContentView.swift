@@ -2,8 +2,12 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
-    @Bindable var store: CADDocumentStore
+    /// File to open when the window appears (a new window opened for a file).
+    let initialURL: URL?
+    @State private var store = CADDocumentStore()
     @State private var showsImporter = false
+    @State private var isDropTargeted = false
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         Group {
@@ -24,7 +28,7 @@ struct ContentView: View {
         ) { result in
             switch result {
             case .success(let urls):
-                if let url = urls.first { store.open(url) }
+                if let url = urls.first { CADWindowRouter.shared.open(url) }
             case .failure(let error): store.errorMessage = error.localizedDescription
             }
         }
@@ -37,7 +41,31 @@ struct ContentView: View {
             Text(store.errorMessage ?? "Unknown error")
         }
         .onReceive(NotificationCenter.default.publisher(for: .showCADImporter)) { _ in
-            showsImporter = true
+            if CADWindowRouter.shared.keyStore === store { showsImporter = true }
+        }
+        // Drag a file from Finder onto the window.
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+            guard let provider = providers.first else { return false }
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url else { return }
+                Task { @MainActor in CADWindowRouter.shared.open(url) }
+            }
+            return true
+        }
+        .overlay {
+            if isDropTargeted {
+                RoundedRectangle(cornerRadius: 14)
+                    .strokeBorder(Color.accentColor, lineWidth: 3)
+                    .padding(6)
+                    .allowsHitTesting(false)
+            }
+        }
+        .onAppear {
+            CADWindowRouter.shared.openWindow = { url in openWindow(value: url) }
+            CADWindowRouter.shared.register(store)
+            if let initialURL, store.asset == nil, !store.isLoading {
+                store.open(initialURL)
+            }
         }
         .ignoresSafeArea(.container, edges: .top)
         .overlay(alignment: .top) {
@@ -51,8 +79,8 @@ struct ContentView: View {
             }
             .frame(height: 30)
         }
-        .toolbar(removing: .title)
         .toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        .background(WindowDocumentBinder(store: store))
         .overlay(alignment: .bottomLeading) {
             Text(CADBuildInfo.stamp)
                 .font(.custom("Helvetica", size: 10))
@@ -63,6 +91,56 @@ struct ContentView: View {
                 .allowsHitTesting(false)
         }
         .background(CADGlassBackground().ignoresSafeArea())
+    }
+}
+
+/// Keeps the NSWindow's title and proxy icon on the open file (Cmd-click
+/// the title for the path, drag it to Finder), and registers the window's
+/// document with the router whenever the window becomes key.
+private struct WindowDocumentBinder: NSViewRepresentable {
+    let store: CADDocumentStore
+
+    func makeNSView(context: Context) -> NSView {
+        let view = BinderView()
+        view.store = store
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        (view as? BinderView)?.store = store
+        (view as? BinderView)?.applyTitle()
+    }
+
+    @MainActor
+    final class BinderView: NSView {
+        var store: CADDocumentStore?
+        private var observer: NSObjectProtocol?
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            observer.map(NotificationCenter.default.removeObserver)
+            guard let window else { return }
+            // representedURL gives the window its document identity (Finder
+            // drag of the proxy, Cmd-click path); the visible name is drawn by
+            // the viewer since the hidden-title-bar style suppresses the title.
+            window.titlebarAppearsTransparent = true
+            applyTitle()
+            observer = NotificationCenter.default.addObserver(
+                forName: NSWindow.didBecomeKeyNotification, object: window, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let store = self?.store else { return }
+                    CADWindowRouter.shared.register(store)
+                }
+            }
+            if window.isKeyWindow, let store { CADWindowRouter.shared.register(store) }
+        }
+
+        func applyTitle() {
+            guard let window else { return }
+            let url = store?.representedURL ?? store?.loadingURL
+            window.representedURL = url
+            window.title = url?.lastPathComponent ?? "CADQuickLook"
+        }
     }
 }
 
