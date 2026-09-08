@@ -71,6 +71,19 @@ typedef struct CADTriangle {
     uint32_t faceIndex;
 } CADTriangle;
 
+typedef struct CADPoint3D {
+    double x, y, z;
+} CADPoint3D;
+
+typedef enum CADSurfaceType {
+    CADSurfaceTypeOther = 0,
+    CADSurfaceTypePlane = 1,
+    CADSurfaceTypeCylinder = 2,
+    CADSurfaceTypeCone = 3,
+    CADSurfaceTypeSphere = 4,
+    CADSurfaceTypeTorus = 5
+} CADSurfaceType;
+
 /// The triangles for each face are contiguous. Empty/degenerate faces have a
 /// triangleCount of zero but still have a range entry.
 typedef struct CADFaceRange {
@@ -79,11 +92,26 @@ typedef struct CADFaceRange {
     /// Exact OCCT B-Rep surface area in squared model units, or -1 until
     /// CADBridgeModelFaceArea() computes it on demand.
     double exactArea;
+    /// Analytic classification of the underlying surface (CADSurfaceType).
+    uint8_t surfaceType;
+    /// Cylinder/sphere radius, cone reference radius, torus major radius.
+    double radius;
+    /// Cylinder/cone: height of the trimmed face along its axis. 0 otherwise.
+    double extent;
+    /// Plane: the outward unit normal (face orientation applied).
+    /// Cylinder/cone/torus: the unit axis direction. Zero otherwise.
+    CADPoint3D axisDirection;
+    /// STEP colour (sRGB 0...1) from the face, its body or its assembly
+    /// instance; valid when hasColor is 1.
+    float red, green, blue;
+    uint8_t hasColor;
 } CADFaceRange;
 
-typedef struct CADPoint3D {
-    double x, y, z;
-} CADPoint3D;
+typedef enum CADCurveType {
+    CADCurveTypeOther = 0,
+    CADCurveTypeLine = 1,
+    CADCurveTypeCircle = 2
+} CADCurveType;
 
 /// An edge references a contiguous range in CADBridgeModelPolylinePoints().
 typedef struct CADEdgePolyline {
@@ -100,6 +128,10 @@ typedef struct CADEdgePolyline {
     /// fillet boundary, a cylinder seam): a "tangent edge" that CAD viewers
     /// usually draw faintly or not at all. 0 for sharp and free edges.
     uint8_t isTangent;
+    /// Analytic classification of the underlying curve (CADCurveType).
+    uint8_t curveType;
+    /// Line: unit direction. Circle: unit axis (normal of the circle's plane).
+    CADPoint3D direction;
 } CADEdgePolyline;
 
 typedef struct CADBounds {
@@ -125,6 +157,21 @@ typedef struct CADFaceDistance {
     CADPoint3D pointOnFaceA;
     CADPoint3D pointOnFaceB;
 } CADFaceDistance;
+
+typedef enum CADMeasureEntityKind {
+    /// An arbitrary point; `point` is used and `index` ignored.
+    CADMeasureEntityKindPoint = 0,
+    /// A B-Rep edge; `index` is zero-based into CADBridgeModelEdges().
+    CADMeasureEntityKindEdge = 1,
+    /// A B-Rep face; `index` is zero-based into CADBridgeModelFaceRanges().
+    CADMeasureEntityKindFace = 2
+} CADMeasureEntityKind;
+
+typedef struct CADMeasureEntity {
+    uint8_t kind;
+    uint32_t index;
+    CADPoint3D point;
+} CADMeasureEntity;
 
 /// Sensible interactive-view defaults. The linear and edge deflections are
 /// automatic (0); angular deflection is 0.15 radians; parallel is enabled.
@@ -172,6 +219,14 @@ CADBridgeStatus CADBridgeModelMeasureFaceDistance(CADBridgeModel *model,
                                                   uint32_t faceA,
                                                   uint32_t faceB,
                                                   CADFaceDistance *result);
+
+/// Computes the exact minimum distance between any two entities (points,
+/// edges, faces in any combination). `pointOnFaceA`/`pointOnFaceB` are the
+/// closest points on the first and second entity.
+CADBridgeStatus CADBridgeModelMeasureDistance(CADBridgeModel *model,
+                                              CADMeasureEntity a,
+                                              CADMeasureEntity b,
+                                              CADFaceDistance *result);
 
 #ifdef __cplusplus
 } // extern "C"

@@ -70,6 +70,68 @@ final class CADModelAsset: @unchecked Sendable {
     let edges: [CADEdgePolyline]
     let bounds: CADBounds
     let stats: CADModelStats
+    /// Drawings only: per-edge colour (nil = default) and the text entities, in millimetres.
+    let edgeColors: [SIMD3<Float>?]
+    let drawingTexts: [DXFText]
+
+    /// Triangles grouped by STEP face colour, one group per distinct colour
+    /// (nil = the default material). Each group becomes one geometry
+    /// element, so a hit's (element, primitive) maps back through
+    /// `elementTriangles`.
+    struct SurfaceGroup {
+        let color: SIMD3<Float>?
+        let triangleIndices: [UInt32]
+    }
+
+    private(set) lazy var surfaceGroups: [SurfaceGroup] = {
+        let colored = faceRanges.contains { $0.hasColor != 0 }
+        guard colored, !triangles.isEmpty else {
+            return [SurfaceGroup(color: nil, triangleIndices: Array(0..<UInt32(triangles.count)))]
+        }
+        // Quantise to 8 bits so near-identical exporter colours share a material.
+        func key(_ range: CADFaceRange) -> UInt32? {
+            guard range.hasColor != 0 else { return nil }
+            let r = UInt32(max(0, min(255, range.red * 255)))
+            let g = UInt32(max(0, min(255, range.green * 255)))
+            let b = UInt32(max(0, min(255, range.blue * 255)))
+            return r << 16 | g << 8 | b
+        }
+        let maximumColors = 48
+        var order: [UInt32?] = []
+        var buckets: [UInt32?: [UInt32]] = [:]
+        var faceKeys: [UInt32?] = faceRanges.map(key)
+        var distinct = Set(faceKeys.compactMap { $0 })
+        if distinct.count > maximumColors {
+            // Keep the most-used colours; the rest fall back to the default.
+            var counts: [UInt32: Int] = [:]
+            for (index, range) in faceRanges.enumerated() {
+                if let k = faceKeys[index] { counts[k, default: 0] += Int(range.triangleCount) }
+            }
+            distinct = Set(counts.sorted { $0.value > $1.value }.prefix(maximumColors).map(\.key))
+            faceKeys = faceKeys.map { $0.flatMap { distinct.contains($0) ? $0 : nil } }
+        }
+        for (index, triangle) in triangles.enumerated() {
+            let face = Int(triangle.faceIndex)
+            let k: UInt32? = faceRanges.indices.contains(face) ? faceKeys[face] : nil
+            if buckets[k] == nil {
+                buckets[k] = []
+                order.append(k)
+            }
+            buckets[k]!.append(UInt32(index))
+        }
+        return order.map { k in
+            let color = k.map { SIMD3<Float>(Float($0 >> 16 & 0xFF), Float($0 >> 8 & 0xFF), Float($0 & 0xFF)) / 255 }
+            return SurfaceGroup(color: color, triangleIndices: buckets[k] ?? [])
+        }
+    }()
+
+    /// Global triangle index for a hit on surface element `element`, primitive `primitive`.
+    func triangleIndex(element: Int, primitive: Int) -> Int? {
+        guard surfaceGroups.indices.contains(element) else { return nil }
+        let group = surfaceGroups[element].triangleIndices
+        guard group.indices.contains(primitive) else { return nil }
+        return Int(group[primitive])
+    }
 
     /// Position/normal sources over the shared vertex buffer, built once and
     /// reused by the surface node and every face-highlight geometry (building
@@ -146,6 +208,7 @@ final class CADModelAsset: @unchecked Sendable {
             let scale = drawing.unitScaleToMillimeters
             var points: [CADPoint3D] = []
             var edges: [CADEdgePolyline] = []
+            var colors: [SIMD3<Float>?] = []
             var minimum = SIMD2<Double>(.greatestFiniteMagnitude, .greatestFiniteMagnitude)
             var maximum = SIMD2<Double>(-.greatestFiniteMagnitude, -.greatestFiniteMagnitude)
             for edge in drawing.edges {
@@ -156,15 +219,37 @@ final class CADModelAsset: @unchecked Sendable {
                     minimum = simd_min(minimum, scaled)
                     maximum = simd_max(maximum, scaled)
                 }
-                edges.append(CADEdgePolyline(
-                    firstPoint: first,
-                    pointCount: UInt32(edge.points.count),
-                    exactLength: edge.length * scale,
-                    isCircular: edge.isCircular ? 1 : 0,
-                    exactDiameter: edge.diameter * scale,
-                    isTangent: 0
-                ))
+                var polyline = CADEdgePolyline()
+                polyline.firstPoint = first
+                polyline.pointCount = UInt32(edge.points.count)
+                polyline.exactLength = edge.length * scale
+                polyline.isCircular = edge.isCircular ? 1 : 0
+                polyline.exactDiameter = edge.diameter * scale
+                polyline.isTangent = 0
+                if edge.isCircular {
+                    polyline.curveType = UInt8(CADCurveTypeCircle.rawValue)
+                    polyline.direction = CADPoint3D(x: 0, y: 0, z: 1)
+                } else if edge.points.count == 2 {
+                    let delta = edge.points[1] - edge.points[0]
+                    let length = simd_length(delta)
+                    if length > 0 {
+                        polyline.curveType = UInt8(CADCurveTypeLine.rawValue)
+                        polyline.direction = CADPoint3D(x: delta.x / length, y: delta.y / length, z: 0)
+                    }
+                }
+                edges.append(polyline)
+                colors.append(edge.color)
             }
+            var texts = drawing.texts
+            for index in texts.indices {
+                texts[index].position *= scale
+                texts[index].height *= scale
+                let p = texts[index].position
+                minimum = simd_min(minimum, p)
+                maximum = simd_max(maximum, p)
+            }
+            edgeColors = colors.contains { $0 != nil } ? colors : []
+            drawingTexts = texts
             handle = nil
             isPlanar = true
             vertices = []
@@ -233,6 +318,8 @@ final class CADModelAsset: @unchecked Sendable {
         edges = Self.copy(CADBridgeModelEdges(model), count: CADBridgeModelEdgeCount(model))
         bounds = CADBridgeModelBounds(model)
         stats = CADBridgeModelStats(model)
+        edgeColors = []
+        drawingTexts = []
     }
 
     deinit {
@@ -255,18 +342,22 @@ final class CADModelAsset: @unchecked Sendable {
         return length
     }
 
-    func distance(faceA: Int, faceB: Int) throws -> CADFaceDistance {
-        guard let handle else { throw CADModelError.loadFailed("Drawings have no faces to measure between.") }
+    /// Exact minimum distance between two entities (points, edges, faces in
+    /// any combination), with the closest point on each.
+    func distance(from a: CADMeasureEntity, to b: CADMeasureEntity) throws -> CADFaceDistance {
+        guard let handle else {
+            // Drawings: only point-to-point is available, done in Swift.
+            guard a.kind == CADMeasureEntityKindPoint.rawValue, b.kind == CADMeasureEntityKindPoint.rawValue else {
+                throw CADModelError.loadFailed("Drawings only support point-to-point measurement.")
+            }
+            let delta = b.point.simdDouble - a.point.simdDouble
+            return CADFaceDistance(distance: simd_length(delta), pointOnFaceA: a.point, pointOnFaceB: b.point)
+        }
         var result = CADFaceDistance()
-        let status = CADBridgeModelMeasureFaceDistance(
-            handle,
-            UInt32(faceA),
-            UInt32(faceB),
-            &result
-        )
+        let status = CADBridgeModelMeasureDistance(handle, a, b, &result)
         guard status == CADBridgeStatusOK else {
             let detail = CADBridgeModelLastError(handle).map { String(cString: $0) }
-                ?? "The distance between those faces could not be measured."
+                ?? "The distance between those entities could not be measured."
             throw CADModelError.loadFailed(detail)
         }
         return result

@@ -5,6 +5,7 @@ struct SettingsView: View {
     @State private var navigationPresetRawValue = CADPreferences.navigationPreset.rawValue
     @State private var cameraProjectionRawValue = CADPreferences.cameraProjection.rawValue
     @State private var lengthUnitRawValue = CADPreferences.lengthUnit.rawValue
+    @State private var opensInNewWindow = CADPreferences.opensFilesInNewWindow
 
     private var navigationPreset: CADNavigationPreset {
         CADNavigationPreset(rawValue: navigationPresetRawValue) ?? .onshape
@@ -24,6 +25,13 @@ struct SettingsView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Section("Windows") {
+                Toggle("Open files in a new window", isOn: $opensInNewWindow)
+                Text("Off: opening a file replaces the one in the front window.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Camera") {
@@ -67,7 +75,7 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 480, height: 520)
+        .frame(width: 480, height: 600)
         .navigationTitle("General")
         .onChange(of: navigationPresetRawValue) { _, rawValue in
             guard let preset = CADNavigationPreset(rawValue: rawValue) else { return }
@@ -76,6 +84,9 @@ struct SettingsView: View {
         .onChange(of: cameraProjectionRawValue) { _, rawValue in
             guard let projection = CADCameraProjection(rawValue: rawValue) else { return }
             CADPreferences.setCameraProjection(projection)
+        }
+        .onChange(of: opensInNewWindow) { _, opens in
+            CADPreferences.setOpensFilesInNewWindow(opens)
         }
         .onChange(of: lengthUnitRawValue) { _, rawValue in
             guard let unit = CADLengthUnit(rawValue: rawValue) else { return }

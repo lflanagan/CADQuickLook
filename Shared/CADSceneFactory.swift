@@ -26,6 +26,9 @@ enum CADSceneFactory {
             modelRoot.addChildNode(edges)
             modelRoot.addChildNode(makeHiddenEdgeNode(from: edges, tangent: tangent))
         }
+        if let text = makeTextNode(asset) {
+            modelRoot.addChildNode(text)
+        }
 
         addLighting(to: scene)
         addCamera(to: scene, asset: asset)
@@ -39,25 +42,40 @@ enum CADSceneFactory {
         guard let modelRoot = scene.rootNode.childNode(withName: modelNodeName, recursively: false) else { return }
         let showsEdges = options.shading.showsEdges
         let showsTangent = showsEdges && options.tangentEdges != .removed
-        let showsHidden = showsEdges && options.hiddenEdges == .visible
+        // Wireframe: no surface, so every edge is "visible".
+        let wireframe = !options.shading.showsSurface
+        let showsHidden = showsEdges && (options.hiddenEdges == .visible || wireframe)
         let tangentFade: CGFloat = options.tangentEdges == .phantom ? 0.32 : 1
 
-        if let surface = modelRoot.childNode(withName: surfaceNodeName, recursively: false)?.geometry?.firstMaterial {
-            surface.lightingModel = options.shading == .unshaded ? .constant : .blinn
-            surface.transparency = options.shading == .translucent ? 0.42 : 1
-            surface.transparencyMode = options.shading == .translucent ? .dualLayer : .aOne
-            surface.writesToDepthBuffer = options.shading != .translucent
+        if let surfaceNode = modelRoot.childNode(withName: surfaceNodeName, recursively: false) {
+            surfaceNode.isHidden = wireframe
+            for surface in surfaceNode.geometry?.materials ?? [] {
+                surface.lightingModel = options.shading == .unshaded ? .constant : .blinn
+                surface.transparency = options.shading == .translucent ? 0.42 : 1
+                surface.transparencyMode = options.shading == .translucent ? .dualLayer : .aOne
+                surface.writesToDepthBuffer = options.shading != .translucent
+            }
         }
-        setEdgeNode(edgeNodeName, in: modelRoot, visible: showsEdges, opacity: 1)
-        setEdgeNode(tangentEdgeNodeName, in: modelRoot, visible: showsTangent, opacity: tangentFade)
-        setEdgeNode(hiddenEdgeNodeName, in: modelRoot, visible: showsHidden, opacity: 1)
-        setEdgeNode(hiddenTangentEdgeNodeName, in: modelRoot, visible: showsHidden && showsTangent, opacity: tangentFade)
+        // Edges are dark on the lit surface; with no surface (wireframe,
+        // drawings) they must be light to show on the dark backdrop.
+        let hasSurface = modelRoot.childNode(withName: surfaceNodeName, recursively: false) != nil
+        let lightEdges = wireframe || !hasSurface
+        let edgeColor = NSColor(calibratedWhite: lightEdges ? 0.88 : 0.12, alpha: lightEdges ? 1 : 0.9)
+        let hiddenColor = NSColor(calibratedWhite: lightEdges ? 0.88 : 0.12, alpha: lightEdges ? 0.45 : 0.5)
+        setEdgeNode(edgeNodeName, in: modelRoot, visible: showsEdges, opacity: 1, color: edgeColor)
+        setEdgeNode(tangentEdgeNodeName, in: modelRoot, visible: showsTangent, opacity: tangentFade, color: edgeColor)
+        setEdgeNode(hiddenEdgeNodeName, in: modelRoot, visible: showsHidden, opacity: 1, color: hiddenColor)
+        setEdgeNode(hiddenTangentEdgeNodeName, in: modelRoot, visible: showsHidden && showsTangent, opacity: tangentFade, color: hiddenColor)
     }
 
-    private static func setEdgeNode(_ name: String, in root: SCNNode, visible: Bool, opacity: CGFloat) {
+    private static func setEdgeNode(_ name: String, in root: SCNNode, visible: Bool, opacity: CGFloat, color: NSColor) {
         guard let node = root.childNode(withName: name, recursively: false) else { return }
         node.isHidden = !visible
         node.opacity = opacity
+        // Drawings keep their layer colours; only the default (last-listed
+        // default material, or the single material) follows the shading.
+        guard let materials = node.geometry?.materials else { return }
+        if materials.count == 1 { materials[0].diffuse.contents = color }
     }
 
     static func renderThumbnail(for asset: CADModelAsset, size: CGSize, scale: CGFloat = 2) -> NSImage {
@@ -76,19 +94,34 @@ enum CADSceneFactory {
     private static func makeSurfaceNode(_ asset: CADModelAsset) -> SCNNode? {
         guard !asset.vertices.isEmpty, !asset.triangles.isEmpty else { return nil }
 
-        // A single element for every triangle. SceneKit degrades badly past a
-        // few thousand elements per geometry (garbage materials, render-thread
-        // crashes), and STEP assemblies easily have 10k+ faces. Triangles are
-        // stored face-by-face, so a hit's primitive index maps back to its
-        // face through CADTriangle.faceIndex.
-        let geometry = SCNGeometry(sources: asset.surfaceGeometrySources, elements: [makeTriangleElement(asset.triangles)])
-        let material = SCNMaterial()
-        material.name = "Machined aluminum"
-        material.diffuse.contents = NSColor(calibratedRed: 0.52, green: 0.66, blue: 0.76, alpha: 1)
-        material.metalness.contents = 0.35
-        material.roughness.contents = 0.42
-        material.isDoubleSided = true
-        geometry.materials = [material]
+        // One element per STEP colour (a single element when the model has
+        // none). SceneKit degrades badly past a few thousand elements per
+        // geometry (garbage materials, render-thread crashes), and STEP
+        // assemblies easily have 10k+ faces, so faces are never elements of
+        // their own; the colour groups are capped at a few dozen. A hit's
+        // (element, primitive) maps back to its triangle through
+        // CADModelAsset.triangleIndex(element:primitive:).
+        let groups = asset.surfaceGroups
+        let elements = groups.map { group in
+            makeTriangleElement(group.triangleIndices.lazy.map { asset.triangles[Int($0)] })
+        }
+        let geometry = SCNGeometry(sources: asset.surfaceGeometrySources, elements: elements)
+        geometry.materials = groups.map { group in
+            let material = SCNMaterial()
+            if let color = group.color {
+                material.name = "STEP colour"
+                material.diffuse.contents = NSColor(calibratedRed: CGFloat(color.x), green: CGFloat(color.y), blue: CGFloat(color.z), alpha: 1)
+                material.metalness.contents = 0.2
+                material.roughness.contents = 0.5
+            } else {
+                material.name = "Machined aluminum"
+                material.diffuse.contents = NSColor(calibratedRed: 0.52, green: 0.66, blue: 0.76, alpha: 1)
+                material.metalness.contents = 0.35
+                material.roughness.contents = 0.42
+            }
+            material.isDoubleSided = true
+            return material
+        }
 
         let node = SCNNode(geometry: geometry)
         node.name = surfaceNodeName
@@ -153,37 +186,55 @@ enum CADSceneFactory {
         let points = asset.polylinePoints.map(\.sceneVector)
         let source = SCNGeometrySource(vertices: points)
         // One line element for every edge (see makeSurfaceNode for why).
-        var indices: [UInt32] = []
-        indices.reserveCapacity(points.count * 2)
-        for edge in asset.edges where (edge.isTangent != 0) == tangent {
+        // Drawings with layer colours get one element per colour; everything
+        // else is a single element in the edge colour.
+        var order: [SIMD3<Float>?] = []
+        var groups: [SIMD3<Float>?: [UInt32]] = [:]
+        let maximumColors = 64
+        for (edgeIndex, edge) in asset.edges.enumerated() where (edge.isTangent != 0) == tangent {
             let first = Int(edge.firstPoint)
             let count = Int(edge.pointCount)
             guard count > 1, first + count <= points.count else { continue }
+            var color: SIMD3<Float>? = asset.edgeColors.indices.contains(edgeIndex) ? asset.edgeColors[edgeIndex] : nil
+            if let c = color, groups[c] == nil, order.count >= maximumColors { color = nil }
+            if groups[color] == nil {
+                groups[color] = []
+                order.append(color)
+            }
             for offset in 0..<(count - 1) {
-                indices.append(UInt32(first + offset))
-                indices.append(UInt32(first + offset + 1))
+                groups[color]!.append(UInt32(first + offset))
+                groups[color]!.append(UInt32(first + offset + 1))
             }
         }
-        guard !indices.isEmpty else { return nil }
-        let data = indices.withUnsafeBytes { Data($0) }
-        let element = SCNGeometryElement(
-            data: data,
-            primitiveType: .line,
-            primitiveCount: indices.count / 2,
-            bytesPerIndex: MemoryLayout<UInt32>.size
-        )
-
-        let geometry = SCNGeometry(sources: [source], elements: [element])
-        let material = SCNMaterial()
-        // Drawings have no faces behind the lines, so draw them light on the dark background.
-        material.diffuse.contents = asset.isPlanar
-            ? NSColor(calibratedWhite: 0.88, alpha: 1)
-            : NSColor(calibratedWhite: 0.12, alpha: 0.9)
-        material.lightingModel = .constant
-        // Edge polylines lie exactly on the faces they bound, so without a
-        // depth bias they z-fight and render as broken, stippled lines.
-        material.shaderModifiers = [.geometry: depthBiasModifier(0.0012)]
-        geometry.materials = [material]
+        guard !order.isEmpty else { return nil }
+        var elements: [SCNGeometryElement] = []
+        var materials: [SCNMaterial] = []
+        for color in order {
+            let indices = groups[color] ?? []
+            let data = indices.withUnsafeBytes { Data($0) }
+            elements.append(SCNGeometryElement(
+                data: data,
+                primitiveType: .line,
+                primitiveCount: indices.count / 2,
+                bytesPerIndex: MemoryLayout<UInt32>.size
+            ))
+            let material = SCNMaterial()
+            // Drawings have no faces behind the lines, so draw them light on the dark background.
+            if let color {
+                material.diffuse.contents = NSColor(calibratedRed: CGFloat(color.x), green: CGFloat(color.y), blue: CGFloat(color.z), alpha: 1)
+            } else {
+                material.diffuse.contents = asset.isPlanar
+                    ? NSColor(calibratedWhite: 0.88, alpha: 1)
+                    : NSColor(calibratedWhite: 0.12, alpha: 0.9)
+            }
+            material.lightingModel = .constant
+            // Edge polylines lie exactly on the faces they bound, so without a
+            // depth bias they z-fight and render as broken, stippled lines.
+            material.shaderModifiers = [.geometry: depthBiasModifier(0.0012)]
+            materials.append(material)
+        }
+        let geometry = SCNGeometry(sources: [source], elements: elements)
+        geometry.materials = materials
         let node = SCNNode(geometry: geometry)
         node.name = tangent ? tangentEdgeNodeName : edgeNodeName
         node.categoryBitMask = 2
@@ -191,16 +242,77 @@ enum CADSceneFactory {
         return node
     }
 
+    static let textNodeName = "CADText"
+
+    /// Drawing text (TEXT/MTEXT) as flat glyph outlines in the XY plane.
+    private static func makeTextNode(_ asset: CADModelAsset) -> SCNNode? {
+        guard asset.isPlanar, !asset.drawingTexts.isEmpty else { return nil }
+        let root = SCNNode()
+        root.name = textNodeName
+        let font = NSFont(name: "Helvetica", size: 1) ?? .systemFont(ofSize: 1)
+        // Helvetica's cap height, in em; DXF text height is the cap height.
+        let capHeight = Double(font.capHeight)
+        for text in asset.drawingTexts {
+            let lines = text.text.components(separatedBy: "\n")
+            let lineSpacing = 1.5 * text.height
+            let blockHeight = text.height + Double(lines.count - 1) * lineSpacing
+            let anchor = SCNNode()
+            anchor.position = SCNVector3(text.position.x, text.position.y, 0)
+            anchor.eulerAngles = SCNVector3(0, 0, text.rotation)
+            for (lineIndex, line) in lines.enumerated() where !line.isEmpty {
+                let geometry = SCNText(string: line, extrusionDepth: 0)
+                geometry.font = font
+                geometry.flatness = 0.05
+                let material = SCNMaterial()
+                material.lightingModel = .constant
+                material.isDoubleSided = true
+                if let color = text.color {
+                    material.diffuse.contents = NSColor(calibratedRed: CGFloat(color.x), green: CGFloat(color.y), blue: CGFloat(color.z), alpha: 1)
+                } else {
+                    material.diffuse.contents = NSColor(calibratedWhite: 0.88, alpha: 1)
+                }
+                geometry.materials = [material]
+                let node = SCNNode(geometry: geometry)
+                let scale = text.height / max(capHeight, 0.01)
+                let (minBound, maxBound) = geometry.boundingBox
+                let width = Double(maxBound.x - minBound.x) * scale
+                var x = -Double(minBound.x) * scale
+                switch text.horizontalAnchor {
+                case 1: x -= width / 2
+                case 2: x -= width
+                default: break
+                }
+                // Baseline of the first line sits `blockHeight - height` above the block bottom.
+                var y = -Double(lineIndex) * lineSpacing
+                switch text.verticalAnchor {
+                case 1: y += blockHeight / 2 - text.height
+                case 2: y -= text.height
+                default: y += blockHeight - text.height
+                }
+                node.position = SCNVector3(x, y, 0)
+                node.scale = SCNVector3(scale, scale, scale)
+                anchor.addChildNode(node)
+            }
+            root.addChildNode(anchor)
+        }
+        root.categoryBitMask = 2
+        root.renderingOrder = 10
+        return root
+    }
+
     /// A copy of an edge node that ignores the depth buffer, drawn faintly
     /// beneath the real one so edges behind the surface show through.
     private static func makeHiddenEdgeNode(from edges: SCNNode, tangent: Bool) -> SCNNode {
         let geometry = edges.geometry!.copy() as! SCNGeometry
         let material = SCNMaterial()
-        material.diffuse.contents = NSColor(calibratedWhite: 0.12, alpha: 0.28)
+        // Hidden edges only ever show through the (opaque) surface, so a
+        // half-strength version of the edge colour reads as the classic
+        // grey hidden line.
+        material.diffuse.contents = NSColor(calibratedWhite: 0.12, alpha: 0.5)
         material.lightingModel = .constant
         material.readsFromDepthBuffer = false
         material.writesToDepthBuffer = false
-        geometry.materials = [material]
+        geometry.materials = Array(repeating: material, count: max(1, geometry.elements.count))
         let node = SCNNode(geometry: geometry)
         node.name = tangent ? hiddenTangentEdgeNodeName : hiddenEdgeNodeName
         node.categoryBitMask = 2

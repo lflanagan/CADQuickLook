@@ -1,6 +1,8 @@
 #include "CADBridge.h"
 
 #include <BRepAdaptor_Curve.hxx>
+#include <BRepAdaptor_Surface.hxx>
+#include <BRepBuilderAPI_MakeVertex.hxx>
 #include <BRepBndLib.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
 #include <BRepGProp.hxx>
@@ -13,7 +15,16 @@
 #include <GCPnts_QuasiUniformDeflection.hxx>
 #include <GProp_GProps.hxx>
 #include <Geom2d_Curve.hxx>
+#include <GeomConvert_CurveToAnaCurve.hxx>
+#include <GeomConvert_SurfToAnaSurf.hxx>
 #include <GeomLProp_SLProps.hxx>
+#include <Geom_Circle.hxx>
+#include <Geom_ConicalSurface.hxx>
+#include <Geom_CylindricalSurface.hxx>
+#include <Geom_Line.hxx>
+#include <Geom_Plane.hxx>
+#include <Geom_SphericalSurface.hxx>
+#include <Geom_ToroidalSurface.hxx>
 #include <Geom_Surface.hxx>
 #include <IGESControl_Reader.hxx>
 #include <IFSelect_ReturnStatus.hxx>
@@ -41,9 +52,18 @@
 #include <TopoDS_Edge.hxx>
 #include <TopoDS_Face.hxx>
 #include <TopoDS_Shape.hxx>
+#include <Quantity_Color.hxx>
+#include <XCAFDoc_ColorTool.hxx>
 #include <XCAFDoc_DocumentTool.hxx>
 #include <XCAFDoc_ShapeTool.hxx>
+#include <gp_Circ.hxx>
+#include <gp_Cone.hxx>
+#include <gp_Cylinder.hxx>
 #include <gp_Dir.hxx>
+#include <gp_Lin.hxx>
+#include <gp_Pln.hxx>
+#include <gp_Sphere.hxx>
+#include <gp_Torus.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 #include <gp_XYZ.hxx>
@@ -54,11 +74,17 @@
 #include <filesystem>
 #include <limits>
 #include <mutex>
+#include <array>
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct CADBridgeModel {
     TopoDS_Shape shape;
+    /// STEP colours keyed by face TShape, gathered from the XDE document at
+    /// import and applied to CADFaceRange in buildMesh.
+    std::unordered_map<const TopoDS_TShape*, std::array<float, 3>> faceColors;
     std::vector<TopoDS_Face> faces;
     std::vector<TopoDS_Edge> edgeShapes;
     std::vector<CADVertex> vertices;
@@ -122,6 +148,7 @@ CADPoint3D point(const gp_Pnt& value) {
 
 void clearModel(CADBridgeModel& model) {
     model.shape.Nullify();
+    model.faceColors.clear();
     model.faces.clear();
     model.edgeShapes.clear();
     model.vertices.clear();
@@ -132,6 +159,119 @@ void clearModel(CADBridgeModel& model) {
     model.bounds = {};
     model.stats = {};
     model.error.clear();
+}
+
+CADPoint3D point(const gp_Dir& value) {
+    return {value.X(), value.Y(), value.Z()};
+}
+
+/// Tolerance for recognising an analytic curve/surface hiding in a spline
+/// (many exporters write cylinders and circles as NURBS). Model units are
+/// millimetres, so this is a micron-scale fit on ordinary parts.
+constexpr double analyticTolerance = 1.0e-3;
+
+/// Exporters often write cylinders, cones and spheres as B-spline surfaces.
+/// Try to recover the analytic surface so the viewer can report a diameter.
+void recoverAnalyticSurface(const TopoDS_Face& face, bool reversed, CADFaceRange& range) {
+    TopLoc_Location location;
+    const Handle(Geom_Surface) surface = BRep_Tool::Surface(face, location);
+    if (surface.IsNull()) return;
+    Standard_Real umin, umax, vmin, vmax;
+    BRepTools::UVBounds(face, umin, umax, vmin, vmax);
+    if (!std::isfinite(umin) || !std::isfinite(umax) || !std::isfinite(vmin) || !std::isfinite(vmax)) return;
+    GeomConvert_SurfToAnaSurf converter(surface);
+    converter.SetConvType(GeomConvert_Simplest);
+    Handle(Geom_Surface) analytic = converter.ConvertToAnalytical(analyticTolerance, umin, umax, vmin, vmax);
+    if (analytic.IsNull()) return;
+    analytic->Transform(location.Transformation());
+
+    if (Handle(Geom_CylindricalSurface) cylinder = Handle(Geom_CylindricalSurface)::DownCast(analytic)) {
+        range.surfaceType = CADSurfaceTypeCylinder;
+        range.radius = cylinder->Radius();
+        range.axisDirection = point(cylinder->Axis().Direction());
+    } else if (Handle(Geom_SphericalSurface) sphere = Handle(Geom_SphericalSurface)::DownCast(analytic)) {
+        range.surfaceType = CADSurfaceTypeSphere;
+        range.radius = sphere->Radius();
+    } else if (Handle(Geom_ConicalSurface) cone = Handle(Geom_ConicalSurface)::DownCast(analytic)) {
+        range.surfaceType = CADSurfaceTypeCone;
+        range.radius = cone->RefRadius();
+        range.axisDirection = point(cone->Axis().Direction());
+    } else if (Handle(Geom_ToroidalSurface) torus = Handle(Geom_ToroidalSurface)::DownCast(analytic)) {
+        range.surfaceType = CADSurfaceTypeTorus;
+        range.radius = torus->MajorRadius();
+        range.axisDirection = point(torus->Axis().Direction());
+    } else if (Handle(Geom_Plane) plane = Handle(Geom_Plane)::DownCast(analytic)) {
+        gp_Dir normal = plane->Axis().Direction();
+        if (!plane->Pln().Direct()) normal.Reverse();
+        if (reversed) normal.Reverse();
+        range.surfaceType = CADSurfaceTypePlane;
+        range.axisDirection = point(normal);
+    }
+}
+
+/// Fills the analytic surface metadata of a face (type, radius, axis...).
+/// Leaves the range's surfaceType at "other" for free-form and unreadable
+/// surfaces.
+void classifyFace(const TopoDS_Face& face, CADFaceRange& range) {
+    range.surfaceType = CADSurfaceTypeOther;
+    range.radius = 0.0;
+    range.extent = 0.0;
+    range.axisDirection = {};
+    try {
+        // BRepAdaptor_Surface applies the face's location, so every
+        // datum below is already in model coordinates.
+        const BRepAdaptor_Surface surface(face);
+        const bool reversed = face.Orientation() == TopAbs_REVERSED;
+        switch (surface.GetType()) {
+        case GeomAbs_Plane: {
+            const gp_Pln plane = surface.Plane();
+            gp_Dir normal = plane.Axis().Direction();
+            // gp_Pln's normal follows its coordinate system, which can be
+            // left-handed after a mirror; the surface normal is X ^ Y.
+            if (!plane.Direct()) normal.Reverse();
+            if (reversed) normal.Reverse();
+            range.surfaceType = CADSurfaceTypePlane;
+            range.axisDirection = point(normal);
+            break;
+        }
+        case GeomAbs_Cylinder: {
+            const gp_Cylinder cylinder = surface.Cylinder();
+            range.surfaceType = CADSurfaceTypeCylinder;
+            range.radius = cylinder.Radius();
+            range.axisDirection = point(cylinder.Axis().Direction());
+            range.extent = std::abs(surface.LastVParameter() - surface.FirstVParameter());
+            break;
+        }
+        case GeomAbs_Cone: {
+            const gp_Cone cone = surface.Cone();
+            range.surfaceType = CADSurfaceTypeCone;
+            range.radius = cone.RefRadius();
+            range.axisDirection = point(cone.Axis().Direction());
+            // V runs along the generatrix; project onto the axis.
+            range.extent = std::abs(surface.LastVParameter() - surface.FirstVParameter()) * std::cos(cone.SemiAngle());
+            break;
+        }
+        case GeomAbs_Sphere: {
+            const gp_Sphere sphere = surface.Sphere();
+            range.surfaceType = CADSurfaceTypeSphere;
+            range.radius = sphere.Radius();
+            break;
+        }
+        case GeomAbs_Torus: {
+            const gp_Torus torus = surface.Torus();
+            range.surfaceType = CADSurfaceTypeTorus;
+            range.radius = torus.MajorRadius();
+            range.axisDirection = point(torus.Axis().Direction());
+            break;
+        }
+        default:
+            recoverAnalyticSurface(face, reversed, range);
+            break;
+        }
+        if (!std::isfinite(range.extent)) range.extent = 0.0;
+    } catch (const Standard_Failure&) {
+        range.surfaceType = CADSurfaceTypeOther;
+    }
 }
 
 CADBridgeStatus fail(CADBridgeModel& model, CADBridgeStatus status, std::string message) {
@@ -145,6 +285,54 @@ std::string lowercaseExtension(const std::filesystem::path& path) {
         return static_cast<char>(std::tolower(character));
     });
     return result;
+}
+
+std::array<float, 3> srgb(const Quantity_Color& color) {
+    Standard_Real red, green, blue;
+    color.Values(red, green, blue, Quantity_TOC_sRGB);
+    return {static_cast<float>(red), static_cast<float>(green), static_cast<float>(blue)};
+}
+
+/// Walks the XDE product structure so instance colours (set on the
+/// assembly component that references a part) reach that part's faces, and
+/// records the most specific colour for every face: face > body > instance.
+void collectFaceColors(const Handle(XCAFDoc_ShapeTool)& shapeTool,
+                       const Handle(XCAFDoc_ColorTool)& colorTool,
+                       const TDF_Label& label,
+                       std::optional<Quantity_Color> inherited,
+                       std::unordered_map<const TopoDS_TShape*, std::array<float, 3>>& out,
+                       int depth) {
+    if (depth > 64 || label.IsNull()) return;
+    Quantity_Color own;
+    if (colorTool->GetColor(label, XCAFDoc_ColorSurf, own) || colorTool->GetColor(label, XCAFDoc_ColorGen, own)) {
+        inherited = own;
+    }
+    if (shapeTool->IsReference(label)) {
+        TDF_Label referred;
+        if (shapeTool->GetReferredShape(label, referred)) {
+            collectFaceColors(shapeTool, colorTool, referred, inherited, out, depth + 1);
+        }
+        return;
+    }
+    if (shapeTool->IsAssembly(label)) {
+        TDF_LabelSequence components;
+        shapeTool->GetComponents(label, components);
+        for (Standard_Integer index = 1; index <= components.Length(); ++index) {
+            collectFaceColors(shapeTool, colorTool, components.Value(index), inherited, out, depth + 1);
+        }
+        return;
+    }
+    const TopoDS_Shape shape = shapeTool->GetShape(label);
+    if (shape.IsNull()) return;
+    for (TopExp_Explorer explorer(shape, TopAbs_FACE); explorer.More(); explorer.Next()) {
+        const TopoDS_Face face = TopoDS::Face(explorer.Current());
+        std::optional<Quantity_Color> chosen = inherited;
+        Quantity_Color faceColor;
+        if (colorTool->GetColor(face, XCAFDoc_ColorSurf, faceColor) || colorTool->GetColor(face, XCAFDoc_ColorGen, faceColor)) {
+            chosen = faceColor;
+        }
+        if (chosen) out[face.TShape().get()] = srgb(*chosen);
+    }
 }
 
 bool importShape(CADBridgeModel& model,
@@ -180,6 +368,14 @@ bool importShape(CADBridgeModel& model,
         TDF_LabelSequence freeShapes;
         shapeTool->GetFreeShapes(freeShapes);
         shape = XCAFDoc_ShapeTool::GetOneShape(freeShapes);
+        try {
+            const Handle(XCAFDoc_ColorTool) colorTool = XCAFDoc_DocumentTool::ColorTool(document->Main());
+            for (Standard_Integer index = 1; index <= freeShapes.Length(); ++index) {
+                collectFaceColors(shapeTool, colorTool, freeShapes.Value(index), std::nullopt, model.faceColors, 0);
+            }
+        } catch (const Standard_Failure&) {
+            model.faceColors.clear();
+        }
         if (shape.IsNull()) {
             // Keep a compatibility path for unusual STEP files that transfer
             // geometry but do not expose a conventional XDE free-shape label.
@@ -217,12 +413,60 @@ bool importShape(CADBridgeModel& model,
     return true;
 }
 
+double boxDiagonal(const Bnd_Box& box) {
+    if (box.IsVoid()) return 0.0;
+    Standard_Real minX, minY, minZ, maxX, maxY, maxZ;
+    box.Get(minX, minY, minZ, maxX, maxY, maxZ);
+    const double dx = maxX - minX, dy = maxY - minY, dz = maxZ - minZ;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
 CADBounds computeBounds(const TopoDS_Shape& shape) {
     CADBounds result{};
+    if (shape.IsNull()) return result;
+
+    // Vertex-only box (BRepBndLib::AddClose is not vertex-only: it bounds
+    // edge curves too, which can be as loose as the surfaces). Cheap, and
+    // immune to the loose surface-based bounds below. It is a sanity
+    // reference, not the answer, because faces can extend well past their
+    // vertices (a full cylinder only has vertices on its seam).
+    Bnd_Box vertexBox;
+    for (TopExp_Explorer explorer(shape, TopAbs_VERTEX); explorer.More(); explorer.Next()) {
+        vertexBox.Add(BRep_Tool::Pnt(TopoDS::Vertex(explorer.Current())));
+    }
+    const double vertexDiagonal = boxDiagonal(vertexBox);
+    Bnd_Box reference = vertexBox;
+    if (!reference.IsVoid()) {
+        reference.Enlarge(std::max(vertexDiagonal, 1.0e-3));
+    }
+
+    // Pole/control-point bounds per face: slightly loose but ~1000x cheaper
+    // than AddOptimal on NURBS-heavy assemblies. Some exporters write faces
+    // whose surface parameter range is vastly larger than the trimmed face
+    // (a 20 km cylinder carrying a 20 mm boss), which makes the pole box
+    // absurd. Those faces fall back to the exact (optimal) box so the
+    // diagonal, and hence the mesh deflection, stays sane. The bounds are
+    // tightened from the mesh later anyway.
     Bnd_Box box;
-    // Pole/control-point bounds: slightly loose but ~1000x cheaper than
-    // AddOptimal on NURBS-heavy assemblies. Tightened from the mesh later.
-    BRepBndLib::Add(shape, box, Standard_False);
+    for (TopExp_Explorer explorer(shape, TopAbs_FACE); explorer.More(); explorer.Next()) {
+        Bnd_Box faceBox;
+        BRepBndLib::Add(explorer.Current(), faceBox, Standard_False);
+        if (!reference.IsVoid() && !faceBox.IsVoid()) {
+            Standard_Real minX, minY, minZ, maxX, maxY, maxZ;
+            faceBox.Get(minX, minY, minZ, maxX, maxY, maxZ);
+            const bool inside = !reference.IsOut(gp_Pnt(minX, minY, minZ)) && !reference.IsOut(gp_Pnt(maxX, maxY, maxZ));
+            if (!inside) {
+                faceBox.SetVoid();
+                BRepBndLib::AddOptimal(explorer.Current(), faceBox, Standard_False, Standard_False);
+            }
+        }
+        box.Add(faceBox);
+    }
+    // Edges that do not belong to any face (wireframe models), plus vertices.
+    for (TopExp_Explorer explorer(shape, TopAbs_EDGE, TopAbs_FACE); explorer.More(); explorer.Next()) {
+        BRepBndLib::Add(explorer.Current(), box, Standard_False);
+    }
+    box.Add(vertexBox);
     if (box.IsVoid()) {
         return result;
     }
@@ -285,11 +529,17 @@ void buildMesh(CADBridgeModel& model) {
                            static_cast<uint32_t>(model.faces.size()));
         }
         const TopoDS_Face& face = model.faces[faceIndex];
-        CADFaceRange range{
-            static_cast<uint32_t>(model.triangles.size()),
-            0,
-            -1.0 // exact area is computed on demand (CADBridgeModelFaceArea)
-        };
+        CADFaceRange range{};
+        range.firstTriangle = static_cast<uint32_t>(model.triangles.size());
+        range.triangleCount = 0;
+        range.exactArea = -1.0; // computed on demand (CADBridgeModelFaceArea)
+        classifyFace(face, range);
+        if (const auto color = model.faceColors.find(face.TShape().get()); color != model.faceColors.end()) {
+            range.red = color->second[0];
+            range.green = color->second[1];
+            range.blue = color->second[2];
+            range.hasColor = 1;
+        }
         TopLoc_Location location;
         Handle(Poly_Triangulation) triangulation = BRep_Tool::Triangulation(face, location);
         if (triangulation.IsNull() || triangulation->NbNodes() == 0) {
@@ -340,20 +590,63 @@ double exactEdgeLength(const TopoDS_Edge& edge) {
     return properties.Mass();
 }
 
-void exactCircularEdgeMetadata(const TopoDS_Edge& edge,
-                               uint8_t& isCircular,
-                               double& exactDiameter) {
-    isCircular = 0;
-    exactDiameter = 0.0;
+/// Exporters often write circular edges as B-splines. Try to recover the
+/// circle (or line) so the viewer can report a diameter.
+void recoverAnalyticCurve(const TopoDS_Edge& edge, CADEdgePolyline& polyline) {
+    TopLoc_Location location;
+    Standard_Real first, last;
+    const Handle(Geom_Curve) curve = BRep_Tool::Curve(edge, location, first, last);
+    if (curve.IsNull() || !std::isfinite(first) || !std::isfinite(last)) return;
+    GeomConvert_CurveToAnaCurve converter(curve);
+    converter.SetConvType(GeomConvert_MinGap);
+    Handle(Geom_Curve) analytic;
+    Standard_Real newFirst = first, newLast = last;
+    if (!converter.ConvertToAnalytical(analyticTolerance, analytic, first, last, newFirst, newLast) || analytic.IsNull()) {
+        return;
+    }
+    analytic->Transform(location.Transformation());
+    if (Handle(Geom_Circle) circle = Handle(Geom_Circle)::DownCast(analytic)) {
+        const gp_Circ circ = circle->Circ();
+        polyline.isCircular = 1;
+        polyline.curveType = CADCurveTypeCircle;
+        polyline.exactDiameter = circ.Radius() * 2.0;
+        polyline.direction = point(circ.Axis().Direction());
+    } else if (Handle(Geom_Line) line = Handle(Geom_Line)::DownCast(analytic)) {
+        polyline.curveType = CADCurveTypeLine;
+        polyline.direction = point(line->Lin().Direction());
+    }
+}
+
+/// Fills the analytic curve metadata of an edge (type, circle axis, line
+/// direction).
+void classifyEdge(const TopoDS_Edge& edge, CADEdgePolyline& polyline) {
+    polyline.isCircular = 0;
+    polyline.exactDiameter = 0.0;
+    polyline.curveType = CADCurveTypeOther;
+    polyline.direction = {};
     try {
         const BRepAdaptor_Curve curve(edge);
-        if (curve.GetType() == GeomAbs_Circle) {
-            isCircular = 1;
-            exactDiameter = curve.Circle().Radius() * 2.0;
+        switch (curve.GetType()) {
+        case GeomAbs_Circle: {
+            const gp_Circ circle = curve.Circle();
+            polyline.isCircular = 1;
+            polyline.curveType = CADCurveTypeCircle;
+            polyline.exactDiameter = circle.Radius() * 2.0;
+            polyline.direction = point(circle.Axis().Direction());
+            break;
+        }
+        case GeomAbs_Line: {
+            polyline.curveType = CADCurveTypeLine;
+            polyline.direction = point(curve.Line().Direction());
+            break;
+        }
+        default:
+            recoverAnalyticCurve(edge, polyline);
+            break;
         }
     } catch (const Standard_Failure&) {
         // Some degenerate edges do not expose an adaptable 3D curve. They are
-        // valid topology, but intentionally remain non-circular metadata-wise.
+        // valid topology, but intentionally remain unclassified.
     }
 }
 
@@ -454,18 +747,14 @@ void buildEdges(CADBridgeModel& model, double edgeDeflection) {
         const uint32_t firstPoint = static_cast<uint32_t>(model.polylinePoints.size());
         appendEdgeSamples(edge, edgeDeflection, model.polylinePoints);
         const uint32_t pointCount = static_cast<uint32_t>(model.polylinePoints.size()) - firstPoint;
-        uint8_t isCircular = 0;
-        double exactDiameter = 0.0;
-        exactCircularEdgeMetadata(edge, isCircular, exactDiameter);
         const TopTools_ListOfShape* faces = edgeFaces.Contains(edge) ? &edgeFaces.FindFromKey(edge) : nullptr;
-        model.edges.push_back({
-            firstPoint,
-            pointCount,
-            -1.0, // exact length is computed on demand (CADBridgeModelEdgeLength)
-            isCircular,
-            exactDiameter,
-            isTangentEdge(edge, faces)
-        });
+        CADEdgePolyline polyline{};
+        polyline.firstPoint = firstPoint;
+        polyline.pointCount = pointCount;
+        polyline.exactLength = -1.0; // computed on demand (CADBridgeModelEdgeLength)
+        classifyEdge(edge, polyline);
+        polyline.isTangent = isTangentEdge(edge, faces);
+        model.edges.push_back(polyline);
     }
 }
 
@@ -517,7 +806,11 @@ bool loadStlMesh(CADBridgeModel& model, const std::filesystem::path& path, std::
         error = "The STL file did not contain any display triangles.";
         return false;
     }
-    model.faceRanges.push_back({0, static_cast<uint32_t>(model.triangles.size()), area});
+    CADFaceRange range{};
+    range.firstTriangle = 0;
+    range.triangleCount = static_cast<uint32_t>(model.triangles.size());
+    range.exactArea = area;
+    model.faceRanges.push_back(range);
     return true;
 }
 
@@ -761,19 +1054,52 @@ CADBridgeStatus CADBridgeModelMeasureFaceDistance(CADBridgeModel *model,
                                                   uint32_t faceA,
                                                   uint32_t faceB,
                                                   CADFaceDistance *result) {
+    CADMeasureEntity a{CADMeasureEntityKindFace, faceA, {}};
+    CADMeasureEntity b{CADMeasureEntityKindFace, faceB, {}};
+    return CADBridgeModelMeasureDistance(model, a, b, result);
+}
+
+namespace {
+
+/// Resolves a measurement entity to a TopoDS shape; false when out of range.
+bool resolveEntity(const CADBridgeModel& model, const CADMeasureEntity& entity, TopoDS_Shape& shape) {
+    switch (entity.kind) {
+    case CADMeasureEntityKindPoint:
+        shape = BRepBuilderAPI_MakeVertex(gp_Pnt(entity.point.x, entity.point.y, entity.point.z)).Vertex();
+        return true;
+    case CADMeasureEntityKindEdge:
+        if (entity.index >= model.edgeShapes.size()) return false;
+        shape = model.edgeShapes[entity.index];
+        return true;
+    case CADMeasureEntityKindFace:
+        if (entity.index >= model.faces.size()) return false;
+        shape = model.faces[entity.index];
+        return true;
+    default:
+        return false;
+    }
+}
+
+} // namespace
+
+CADBridgeStatus CADBridgeModelMeasureDistance(CADBridgeModel *model,
+                                              CADMeasureEntity a,
+                                              CADMeasureEntity b,
+                                              CADFaceDistance *result) {
     if (!model || !result) {
         if (model) model->error = "A model and output measurement are required.";
         return CADBridgeStatusInvalidArgument;
     }
-    if (faceA >= model->faces.size() || faceB >= model->faces.size()) {
-        return fail(*model, CADBridgeStatusOutOfRange, "Face index is out of range.");
-    }
 
     try {
-        BRepExtrema_DistShapeShape distance(model->faces[faceA], model->faces[faceB]);
+        TopoDS_Shape shapeA, shapeB;
+        if (!resolveEntity(*model, a, shapeA) || !resolveEntity(*model, b, shapeB)) {
+            return fail(*model, CADBridgeStatusOutOfRange, "Measurement entity is out of range.");
+        }
+        BRepExtrema_DistShapeShape distance(shapeA, shapeB);
         if (!distance.IsDone() || distance.NbSolution() < 1) {
             return fail(*model, CADBridgeStatusMeasurementFailed,
-                        "Open CASCADE could not compute the minimum face distance.");
+                        "Open CASCADE could not compute the minimum distance.");
         }
         result->distance = distance.Value();
         result->pointOnFaceA = point(distance.PointOnShape1(1));
@@ -787,6 +1113,6 @@ CADBridgeStatus CADBridgeModelMeasureFaceDistance(CADBridgeModel *model,
         return fail(*model, CADBridgeStatusMeasurementFailed,
                     std::string("CAD measurement error: ") + exception.what());
     } catch (...) {
-        return fail(*model, CADBridgeStatusMeasurementFailed, "Unknown face measurement error.");
+        return fail(*model, CADBridgeStatusMeasurementFailed, "Unknown measurement error.");
     }
 }

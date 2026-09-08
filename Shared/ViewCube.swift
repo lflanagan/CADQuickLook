@@ -29,9 +29,6 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
 
     private let cubeView = CADOrientationCubeSceneView(frame: .zero, options: nil)
     private let viewsButton = NSPopUpButton(frame: .zero, pullsDown: true)
-    private var shadingItem: NSMenuItem?
-    private var hiddenEdgeItem: NSMenuItem?
-    private var tangentEdgeItem: NSMenuItem?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -47,14 +44,15 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
 
         configureViewsMenu()
         NSLayoutConstraint.activate([
-            widthAnchor.constraint(equalToConstant: 158),
-            heightAnchor.constraint(equalToConstant: 184),
+            widthAnchor.constraint(equalToConstant: 130),
+            heightAnchor.constraint(equalToConstant: 140),
+            // Cube in the corner, the settings chevron below it on the right.
             cubeView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
             cubeView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
-            cubeView.topAnchor.constraint(equalTo: topAnchor, constant: 30),
-            cubeView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -4),
+            cubeView.topAnchor.constraint(equalTo: topAnchor),
+            cubeView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
             viewsButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
-            viewsButton.topAnchor.constraint(equalTo: topAnchor, constant: 5),
+            viewsButton.topAnchor.constraint(equalTo: cubeView.bottomAnchor, constant: -16),
             viewsButton.widthAnchor.constraint(equalToConstant: 32),
             viewsButton.heightAnchor.constraint(equalToConstant: 24)
         ])
@@ -63,7 +61,7 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
 
     required init?(coder: NSCoder) { nil }
 
-    override var intrinsicContentSize: NSSize { NSSize(width: 158, height: 184) }
+    override var intrinsicContentSize: NSSize { NSSize(width: 130, height: 140) }
 
     private func configureViewsMenu() {
         viewsButton.title = ""
@@ -92,195 +90,169 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
             accessibilityDescription: "Views and settings"
         )
         menu.addItem(displayItem)
-        menu.addItem(.sectionHeader(title: "Standard Views"))
-        for view in CADStandardView.allCases {
-            let item = NSMenuItem(title: view.title, action: #selector(selectStandardView(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = "view:\(view.rawValue)"
-            menu.addItem(item)
-        }
+
+        // Every setting is one item with the choices in a submenu, so the
+        // menu stays short.
+        addSubmenu(to: menu, title: "Standard Views", prefix: "view",
+                   choices: CADStandardView.allCases.map { ($0.rawValue, $0.title) })
         menu.addItem(.separator())
-        menu.addItem(.sectionHeader(title: "Display"))
-        shadingItem = addDisplaySubmenu(to: menu, prefix: "shading", modes: Array(CADShadingMode.allCases))
-        hiddenEdgeItem = addDisplaySubmenu(to: menu, prefix: "hidden", modes: Array(CADHiddenEdgeMode.allCases))
-        tangentEdgeItem = addDisplaySubmenu(to: menu, prefix: "tangent", modes: Array(CADTangentEdgeMode.allCases))
-        refreshDisplayItems()
+        addSubmenu(to: menu, title: "Shading", prefix: "shading",
+                   choices: CADShadingMode.allCases.map { ($0.rawValue, $0.title) })
+        addSubmenu(to: menu, title: "Hidden Edges", prefix: "hidden",
+                   choices: CADHiddenEdgeMode.allCases.map { ($0.rawValue, $0.title) })
+        addSubmenu(to: menu, title: "Tangent Edges", prefix: "tangent",
+                   choices: CADTangentEdgeMode.allCases.map { ($0.rawValue, $0.title) })
+        addSubmenu(to: menu, title: "Projection", prefix: "projection",
+                   choices: CADCameraProjection.allCases.map { ($0.rawValue, $0.title) })
         menu.addItem(.separator())
-        menu.addItem(.sectionHeader(title: "Camera Projection"))
-        let selectedProjection = CADPreferences.cameraProjection
-        for projection in CADCameraProjection.allCases {
-            let item = NSMenuItem(title: projection.title, action: #selector(selectCameraProjection(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = "projection:\(projection.rawValue)"
-            item.state = projection == selectedProjection ? .on : .off
-            menu.addItem(item)
+        addSubmenu(to: menu, title: "Units", prefix: "unit",
+                   choices: CADLengthUnit.allCases.map { ($0.rawValue, "\($0.title) (\($0.symbol))") })
+        let measure = addSubmenu(to: menu, title: "Measure", prefix: "circular",
+                                 choices: CADCircularMeasure.allCases.map { ($0.rawValue, $0.title) },
+                                 header: "Circles and cylinders")
+        measure.submenu?.addItem(.separator())
+        measure.submenu?.addItem(.sectionHeader(title: "Two selections"))
+        for choice in CADPairMeasure.allCases {
+            measure.submenu?.addItem(choiceItem(prefix: "pair", rawValue: choice.rawValue, title: choice.title))
         }
+        measure.submenu?.addItem(.separator())
+        measure.submenu?.addItem(.sectionHeader(title: "Precision"))
+        for choice in CADMeasurementPrecision.allCases {
+            measure.submenu?.addItem(choiceItem(prefix: "precision", rawValue: choice.rawValue, title: choice.title))
+        }
+        measure.submenu?.addItem(.separator())
+        measure.submenu?.addItem(choiceItem(prefix: "details", rawValue: "toggle", title: "Show Details"))
         menu.addItem(.separator())
-        menu.addItem(.sectionHeader(title: "Units"))
-        let selectedUnit = CADPreferences.lengthUnit
-        for unit in CADLengthUnit.allCases {
-            let item = NSMenuItem(title: "\(unit.title) (\(unit.symbol))", action: #selector(selectLengthUnit(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = "unit:\(unit.rawValue)"
-            item.state = unit == selectedUnit ? .on : .off
-            menu.addItem(item)
+        let navigation = addSubmenu(to: menu, title: "Navigation", prefix: "preset",
+                                    choices: CADNavigationPreset.allCases.map { ($0.rawValue, $0.title) })
+        navigation.submenu?.addItem(.separator())
+        for choice in CADOrbitPivotMode.allCases {
+            navigation.submenu?.addItem(choiceItem(prefix: "pivot", rawValue: choice.rawValue, title: choice.title))
         }
-        menu.addItem(.separator())
-        menu.addItem(.sectionHeader(title: "Navigation Controls"))
-        let selectedPreset = CADPreferences.navigationPreset
-        for preset in CADNavigationPreset.allCases {
-            let item = NSMenuItem(title: preset.title, action: #selector(selectNavigationPreset(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = "preset:\(preset.rawValue)"
-            item.state = preset == selectedPreset ? .on : .off
-            menu.addItem(item)
-        }
+
+        refreshChecks(in: menu)
         viewsButton.menu = menu
         viewsButton.selectItem(at: 0)
         viewsButton.image = displayItem.image
     }
 
-    /// A parent item that reads as the current choice (checked, like Onshape's
-    /// view menu) with the alternatives in a native submenu.
-    private func addDisplaySubmenu<Mode: CADDisplayMode>(to menu: NSMenu, prefix: String, modes: [Mode]) -> NSMenuItem {
-        let parent = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        let submenu = NSMenu(title: "")
-        for mode in modes {
-            let item = NSMenuItem(title: mode.title, action: #selector(selectDisplayOption(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = "\(prefix):\(mode.rawValue)"
-            submenu.addItem(item)
+    @discardableResult
+    private func addSubmenu(
+        to menu: NSMenu,
+        title: String,
+        prefix: String,
+        choices: [(rawValue: String, title: String)],
+        header: String? = nil
+    ) -> NSMenuItem {
+        let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: title)
+        if let header { submenu.addItem(.sectionHeader(title: header)) }
+        for choice in choices {
+            submenu.addItem(choiceItem(prefix: prefix, rawValue: choice.rawValue, title: choice.title))
         }
         parent.submenu = submenu
         menu.addItem(parent)
         return parent
     }
 
-    private func refreshDisplayItems() {
+    private func choiceItem(prefix: String, rawValue: String, title: String) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: #selector(selectChoice(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = "\(prefix):\(rawValue)"
+        return item
+    }
+
+    /// The raw value currently selected for each setting prefix; nil for
+    /// actions (standard views).
+    private func selectedRawValue(for prefix: String) -> String? {
         let options = CADPreferences.displayOptions
-        refresh(shadingItem, selected: options.shading)
-        refresh(hiddenEdgeItem, selected: options.hiddenEdges)
-        refresh(tangentEdgeItem, selected: options.tangentEdges)
-    }
-
-    private func refresh<Mode: CADDisplayMode>(_ parent: NSMenuItem?, selected: Mode) {
-        guard let parent else { return }
-        parent.title = selected.title
-        parent.state = .on
-        for item in parent.submenu?.items ?? [] {
-            let isSelected = (item.representedObject as? String)?.hasSuffix(":\(selected.rawValue)") == true
-            item.state = isSelected ? .on : .off
+        switch prefix {
+        case "shading": return options.shading.rawValue
+        case "hidden": return options.hiddenEdges.rawValue
+        case "tangent": return options.tangentEdges.rawValue
+        case "projection": return CADPreferences.cameraProjection.rawValue
+        case "unit": return CADPreferences.lengthUnit.rawValue
+        case "circular": return CADPreferences.circularMeasure.rawValue
+        case "pair": return CADPreferences.pairMeasure.rawValue
+        case "precision": return CADPreferences.measurementPrecision.rawValue
+        case "details": return CADPreferences.showsMeasurementDetails ? "toggle" : "off"
+        case "preset": return CADPreferences.navigationPreset.rawValue
+        case "pivot": return CADPreferences.orbitPivot.rawValue
+        default: return nil
         }
     }
 
-    /// Applies a "shading:", "hidden:" or "tangent:" menu identifier; false for any other.
-    @discardableResult
-    private func applyDisplayIdentifier(_ identifier: String) -> Bool {
-        let parts = identifier.split(separator: ":", maxSplits: 1).map(String.init)
-        guard parts.count == 2 else { return false }
+    private func refreshChecks(in menu: NSMenu) {
+        for item in menu.items {
+            if let submenu = item.submenu {
+                refreshChecks(in: submenu)
+                continue
+            }
+            guard let identifier = item.representedObject as? String,
+                  let separator = identifier.firstIndex(of: ":") else { continue }
+            let prefix = String(identifier[..<separator])
+            let rawValue = String(identifier[identifier.index(after: separator)...])
+            guard let selected = selectedRawValue(for: prefix) else { continue }
+            item.state = rawValue == selected ? .on : .off
+        }
+    }
+
+    /// Applies a "prefix:rawValue" choice.
+    private func apply(_ identifier: String) {
+        guard let separator = identifier.firstIndex(of: ":") else { return }
+        let prefix = String(identifier[..<separator])
+        let rawValue = String(identifier[identifier.index(after: separator)...])
         var options = CADPreferences.displayOptions
-        switch parts[0] {
+        switch prefix {
+        case "view":
+            if let view = CADStandardView(rawValue: rawValue) { onSnap?(view) }
         case "shading":
-            guard let mode = CADShadingMode(rawValue: parts[1]) else { return false }
-            options.shading = mode
+            if let mode = CADShadingMode(rawValue: rawValue) { options.shading = mode }
+            CADPreferences.setDisplayOptions(options)
         case "hidden":
-            guard let mode = CADHiddenEdgeMode(rawValue: parts[1]) else { return false }
-            options.hiddenEdges = mode
+            if let mode = CADHiddenEdgeMode(rawValue: rawValue) { options.hiddenEdges = mode }
+            CADPreferences.setDisplayOptions(options)
         case "tangent":
-            guard let mode = CADTangentEdgeMode(rawValue: parts[1]) else { return false }
-            options.tangentEdges = mode
+            if let mode = CADTangentEdgeMode(rawValue: rawValue) { options.tangentEdges = mode }
+            CADPreferences.setDisplayOptions(options)
+        case "projection":
+            if let projection = CADCameraProjection(rawValue: rawValue) {
+                CADPreferences.setCameraProjection(projection)
+                onProjectionChange?(projection)
+            }
+        case "unit":
+            if let unit = CADLengthUnit(rawValue: rawValue) { CADPreferences.setLengthUnit(unit) }
+        case "circular":
+            if let measure = CADCircularMeasure(rawValue: rawValue) { CADPreferences.setCircularMeasure(measure) }
+        case "pair":
+            if let measure = CADPairMeasure(rawValue: rawValue) { CADPreferences.setPairMeasure(measure) }
+        case "precision":
+            if let precision = CADMeasurementPrecision(rawValue: rawValue) { CADPreferences.setMeasurementPrecision(precision) }
+        case "details":
+            CADPreferences.setShowsMeasurementDetails(!CADPreferences.showsMeasurementDetails)
+        case "preset":
+            if let preset = CADNavigationPreset(rawValue: rawValue) { CADPreferences.setNavigationPreset(preset) }
+        case "pivot":
+            if let mode = CADOrbitPivotMode(rawValue: rawValue) { CADPreferences.setOrbitPivot(mode) }
         default:
-            return false
+            break
         }
-        CADPreferences.setDisplayOptions(options)
-        refreshDisplayItems()
-        return true
-    }
-
-    @objc private func selectDisplayOption(_ sender: NSMenuItem) {
-        guard let identifier = sender.representedObject as? String else { return }
-        applyDisplayIdentifier(identifier)
-        viewsButton.selectItem(at: 0)
+        if let menu = viewsButton.menu { refreshChecks(in: menu) }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
-        refreshDisplayItems()
-        let selectedPreset = CADPreferences.navigationPreset
-        let selectedProjection = CADPreferences.cameraProjection
-        let selectedUnit = CADPreferences.lengthUnit
-        onProjectionChange?(selectedProjection)
-        for item in menu.items {
-            guard let identifier = item.representedObject as? String,
-                  let rawValue = identifier.split(separator: ":", maxSplits: 1).last.map(String.init) else { continue }
-            if identifier.hasPrefix("preset:"),
-               let preset = CADNavigationPreset(rawValue: rawValue) {
-                item.state = preset == selectedPreset ? .on : .off
-            } else if identifier.hasPrefix("projection:"),
-                      let projection = CADCameraProjection(rawValue: rawValue) {
-                item.state = projection == selectedProjection ? .on : .off
-            } else if identifier.hasPrefix("unit:"),
-                      let unit = CADLengthUnit(rawValue: rawValue) {
-                item.state = unit == selectedUnit ? .on : .off
-            }
-        }
+        onProjectionChange?(CADPreferences.cameraProjection)
+        refreshChecks(in: menu)
+    }
+
+    @objc private func selectChoice(_ sender: NSMenuItem) {
+        if let identifier = sender.representedObject as? String { apply(identifier) }
+        viewsButton.selectItem(at: 0)
     }
 
     @objc private func selectMenuItem(_ sender: NSPopUpButton) {
-        guard let identifier = sender.selectedItem?.representedObject as? String else { return }
-        if applyDisplayIdentifier(identifier) {
-            // Display options are handled above.
-        } else if identifier.hasPrefix("view:"),
-           let rawValue = identifier.split(separator: ":", maxSplits: 1).last.map(String.init),
-           let view = CADStandardView(rawValue: rawValue) {
-            onSnap?(view)
-        } else if identifier.hasPrefix("preset:"),
-                  let rawValue = identifier.split(separator: ":", maxSplits: 1).last.map(String.init),
-                  let preset = CADNavigationPreset(rawValue: rawValue) {
-            CADPreferences.setNavigationPreset(preset)
-        } else if identifier.hasPrefix("projection:"),
-                  let rawValue = identifier.split(separator: ":", maxSplits: 1).last.map(String.init),
-                  let projection = CADCameraProjection(rawValue: rawValue) {
-            CADPreferences.setCameraProjection(projection)
-            onProjectionChange?(projection)
-        } else if identifier.hasPrefix("unit:"),
-                  let rawValue = identifier.split(separator: ":", maxSplits: 1).last.map(String.init),
-                  let unit = CADLengthUnit(rawValue: rawValue) {
-            CADPreferences.setLengthUnit(unit)
-        }
+        if let identifier = sender.selectedItem?.representedObject as? String { apply(identifier) }
         sender.selectItem(at: 0)
-    }
-
-    @objc private func selectStandardView(_ sender: NSMenuItem) {
-        guard let identifier = sender.representedObject as? String,
-              let rawValue = identifier.split(separator: ":", maxSplits: 1).last.map(String.init),
-              let view = CADStandardView(rawValue: rawValue) else { return }
-        onSnap?(view)
-        viewsButton.selectItem(at: 0)
-    }
-
-    @objc private func selectNavigationPreset(_ sender: NSMenuItem) {
-        guard let identifier = sender.representedObject as? String,
-              let rawValue = identifier.split(separator: ":", maxSplits: 1).last.map(String.init),
-              let preset = CADNavigationPreset(rawValue: rawValue) else { return }
-        CADPreferences.setNavigationPreset(preset)
-        viewsButton.selectItem(at: 0)
-    }
-
-    @objc private func selectLengthUnit(_ sender: NSMenuItem) {
-        guard let identifier = sender.representedObject as? String,
-              let rawValue = identifier.split(separator: ":", maxSplits: 1).last.map(String.init),
-              let unit = CADLengthUnit(rawValue: rawValue) else { return }
-        CADPreferences.setLengthUnit(unit)
-        viewsButton.selectItem(at: 0)
-    }
-
-    @objc private func selectCameraProjection(_ sender: NSMenuItem) {
-        guard let identifier = sender.representedObject as? String,
-              let rawValue = identifier.split(separator: ":", maxSplits: 1).last.map(String.init),
-              let projection = CADCameraProjection(rawValue: rawValue) else { return }
-        CADPreferences.setCameraProjection(projection)
-        onProjectionChange?(projection)
-        viewsButton.selectItem(at: 0)
     }
 }
 
@@ -377,7 +349,7 @@ private final class CADOrientationCubeSceneView: SCNView {
 
         cameraNode.camera = SCNCamera()
         cameraNode.camera?.usesOrthographicProjection = true
-        cameraNode.camera?.orthographicScale = 2.55
+        cameraNode.camera?.orthographicScale = 2.2
         cameraNode.camera?.automaticallyAdjustsZRange = true
         scene.rootNode.addChildNode(cameraNode)
         pointOfView = cameraNode

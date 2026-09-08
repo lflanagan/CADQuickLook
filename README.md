@@ -6,9 +6,11 @@ A native macOS viewer for STEP, IGES, BREP, STL, and DXF files, with Finder thum
 
 - Perspective and orthographic views
 - Onshape-style navigation and standard view snaps
-- Automatic edge, diameter, face-area, and point-to-point measurements; ⌘C copies the value with its unit
-- Display options: shaded with or without edges, unshaded, translucent; hidden edges visible or removed; tangent edges visible, phantom, or removed
-- STEP assembly placement through Open CASCADE
+- Hover for a measurement: edge length, circle or cylinder diameter, face area, vertex position; click two entities for the distance or angle between them; ⌘C copies the value with its unit
+- Display options: shaded with or without edges, unshaded, translucent, wireframe; hidden edges visible or removed; tangent edges visible, phantom, or removed
+- STEP assembly placement and part colours through Open CASCADE
+- DXF drawings with layer colours, text, dimensions, and hatch boundaries
+- View menu shortcuts (⌘1–⌘7 standard views, ⌘0 fit, P projection, E edges), Open Recent, drag and drop, one window per file
 - STL files are viewed as meshes: no edges or measurements, but multi-million-triangle scans open in seconds
 - The same viewer and controls in the app and Quick Look
 

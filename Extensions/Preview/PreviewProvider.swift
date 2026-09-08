@@ -12,6 +12,12 @@ final class PreviewProvider: NSViewController, @MainActor QLPreviewingController
         view = backdrop
     }
 
+    override func viewDidAppear() {
+        super.viewDidAppear()
+        // Keyboard shortcuts (F, arrows, P, E) without clicking first.
+        viewer.focusViewer()
+    }
+
     func preparePreviewOfFile(at url: URL) async throws {
         preferredContentSize = NSSize(width: 960, height: 720)
         viewer.showLoading("Opening \(url.lastPathComponent)")
