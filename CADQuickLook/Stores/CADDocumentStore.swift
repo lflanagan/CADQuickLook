@@ -14,6 +14,17 @@ final class CADDocumentStore {
 
     var representedURL: URL? { asset?.url }
 
+    /// Drops the open model and abandons any load in flight. Called when the
+    /// window closes: SwiftUI can keep a closed window's state alive, and
+    /// with it hundreds of megabytes of mesh and B-Rep.
+    func close() {
+        loadGeneration += 1
+        asset = nil
+        isLoading = false
+        loadingURL = nil
+        loadingProgress = nil
+    }
+
     func open(_ url: URL) {
         let supported = Set(["step", "stp", "iges", "igs", "brep", "stl", "dxf"])
         guard supported.contains(url.pathExtension.lowercased()) else {

@@ -2,10 +2,19 @@ import AppKit
 import QuickLookThumbnailing
 
 final class ThumbnailProvider: QLThumbnailProvider {
+    /// Finder asks for many thumbnails at once (every icon in a folder).
+    /// Each STEP import peaks at several hundred megabytes to a gigabyte, so
+    /// run them one at a time to keep the extension's footprint to one
+    /// model. Import already serialises on the bridge's translation lock and
+    /// tessellation uses every core, so little throughput is lost.
+    private static let oneAtATime = DispatchSemaphore(value: 1)
+
     override func provideThumbnail(
         for request: QLFileThumbnailRequest,
         _ handler: @escaping (QLThumbnailReply?, (any Error)?) -> Void
     ) {
+        Self.oneAtATime.wait()
+        defer { Self.oneAtATime.signal() }
         do {
             let asset = try CADModelAsset(url: request.fileURL, quality: .thumbnail)
             let image = CADSceneFactory.renderThumbnail(

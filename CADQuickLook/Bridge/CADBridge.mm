@@ -40,6 +40,7 @@
 #include <RWStl.hxx>
 #include <TDF_LabelSequence.hxx>
 #include <TDocStd_Document.hxx>
+#include <XCAFApp_Application.hxx>
 #include <TopAbs_Orientation.hxx>
 #include <TopExp.hxx>
 #include <TopExp_Explorer.hxx>
@@ -67,6 +68,8 @@
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 #include <gp_XYZ.hxx>
+
+#include <malloc/malloc.h>
 
 #include <algorithm>
 #include <cmath>
@@ -358,7 +361,26 @@ bool importShape(CADBridgeModel& model,
             error = "Open CASCADE could not parse the STEP file.";
             return false;
         }
-        Handle(TDocStd_Document) document = new TDocStd_Document("BinXCAF");
+        // Assemblies with instance-specific overrides (SHUO) get
+        // XCAFDoc_GraphNode attributes whose father/child handles form
+        // cycles. Neither dropping the last Handle nor
+        // TDocStd_Application::Close() breaks them (OCCT 7.9: a PCB
+        // assembly leaked 4 MB of nodes per import, forever, in the
+        // long-lived Quick Look extension processes). Forgetting the
+        // attributes explicitly runs XCAFDoc_GraphNode::BeforeForget, which
+        // unlinks them, and then Close() frees the document.
+        const Handle(XCAFApp_Application) application = XCAFApp_Application::GetApplication();
+        Handle(TDocStd_Document) document;
+        application->NewDocument("BinXCAF", document);
+        struct DocumentCloser {
+            Handle(XCAFApp_Application) application;
+            Handle(TDocStd_Document) document;
+            ~DocumentCloser() {
+                if (document.IsNull()) return;
+                try { document->Main().ForgetAllAttributes(Standard_True); } catch (...) {}
+                try { application->Close(document); } catch (...) {}
+            }
+        } closer{application, document};
         Handle(BridgeProgressIndicator) progress = new BridgeProgressIndicator(model, CADLoadStageTranslating, 0);
         if (!reader.Transfer(document, progress->Start())) {
             error = "The STEP file did not contain any transferable shapes.";
@@ -869,6 +891,33 @@ CADBridgeModel *CADBridgeModelCreate(void) {
 
 void CADBridgeModelDestroy(CADBridgeModel *model) {
     delete model;
+    CADBridgeTrimMemory();
+}
+
+void CADBridgeTrimMemory(void) {
+    // A STEP import allocates and frees hundreds of megabytes of small
+    // blocks. malloc keeps those pages for reuse, so a window that has been
+    // closed still shows the model's worth of memory in Activity Monitor.
+    // Ask every zone to hand its empty pages back to the kernel now.
+    malloc_zone_pressure_relief(nullptr, 0);
+}
+
+void CADBridgeModelReleaseDisplayData(CADBridgeModel *model) {
+    if (!model) return;
+    // swap() rather than clear(): clear() keeps the capacity allocated.
+    std::vector<CADVertex>().swap(model->vertices);
+    std::vector<CADTriangle>().swap(model->triangles);
+    std::vector<CADPoint3D>().swap(model->polylinePoints);
+    model->faceColors.clear();
+    // Drop the per-face Poly_Triangulation (and polygons on it) that
+    // BRepMesh attached to the shape. Measurement (BRepExtrema, BRepGProp
+    // with UseTriangulation = false) works on the exact geometry and does
+    // not need it. On a typical assembly this is the largest single block
+    // of memory the model owns.
+    if (!model->shape.IsNull()) {
+        try { BRepTools::Clean(model->shape); } catch (...) {}
+    }
+    CADBridgeTrimMemory();
 }
 
 CADBridgeStatus CADBridgeModelLoad(CADBridgeModel *model, const char *pathUTF8, CADMeshOptions options) {

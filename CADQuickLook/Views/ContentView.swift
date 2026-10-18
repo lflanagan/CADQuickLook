@@ -115,10 +115,25 @@ private struct WindowDocumentBinder: NSViewRepresentable {
     final class BinderView: NSView {
         var store: CADDocumentStore?
         private var observer: NSObjectProtocol?
+        private var closeObserver: NSObjectProtocol?
+
+        isolated deinit {
+            observer.map(NotificationCenter.default.removeObserver)
+            closeObserver.map(NotificationCenter.default.removeObserver)
+        }
+
         override func viewDidMoveToWindow() {
             super.viewDidMoveToWindow()
             observer.map(NotificationCenter.default.removeObserver)
+            closeObserver.map(NotificationCenter.default.removeObserver)
+            observer = nil
+            closeObserver = nil
             guard let window else { return }
+            closeObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: window, queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated { self?.store?.close() }
+            }
             // representedURL gives the window its document identity (Finder
             // drag of the proxy, Cmd-click path); the visible name is drawn by
             // the viewer since the hidden-title-bar style suppresses the title.

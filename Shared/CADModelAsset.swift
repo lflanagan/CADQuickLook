@@ -320,6 +320,10 @@ final class CADModelAsset: @unchecked Sendable {
         stats = CADBridgeModelStats(model)
         edgeColors = []
         drawingTexts = []
+        // The arrays above are the only copies the viewer uses; the bridge's
+        // originals and Open CASCADE's per-face tessellation would otherwise
+        // sit in memory for as long as the model is open.
+        CADBridgeModelReleaseDisplayData(model)
     }
 
     deinit {

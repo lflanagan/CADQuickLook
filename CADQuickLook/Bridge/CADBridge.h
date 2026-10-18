@@ -180,6 +180,17 @@ CADMeshOptions CADBridgeDefaultMeshOptions(void);
 CADBridgeModel *CADBridgeModelCreate(void);
 void CADBridgeModelDestroy(CADBridgeModel *model);
 
+/// Frees the vertex, triangle and polyline buffers and the tessellation that
+/// Open CASCADE attached to the shape, once the host has copied what it
+/// needs. After this call CADBridgeModelVertices(), CADBridgeModelTriangles()
+/// and CADBridgeModelPolylinePoints() return NULL with a count of zero, but
+/// the face/edge tables, bounds, stats and all measurement calls keep working.
+void CADBridgeModelReleaseDisplayData(CADBridgeModel *model);
+
+/// Returns freed malloc pages to the kernel. Called automatically after
+/// CADBridgeModelReleaseDisplayData() and CADBridgeModelDestroy().
+void CADBridgeTrimMemory(void);
+
 /// Loads and tessellates STEP/STP, IGES/IGS, BREP, or STL. Loading another file
 /// replaces all prior shape and display data. The path must be UTF-8.
 CADBridgeStatus CADBridgeModelLoad(CADBridgeModel *model,
