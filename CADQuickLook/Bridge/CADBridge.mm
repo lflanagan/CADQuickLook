@@ -17,6 +17,7 @@
 #include <Geom2d_Curve.hxx>
 #include <GeomConvert_CurveToAnaCurve.hxx>
 #include <GeomConvert_SurfToAnaSurf.hxx>
+#include <Geom_RectangularTrimmedSurface.hxx>
 #include <GeomLProp_SLProps.hxx>
 #include <Geom_Circle.hxx>
 #include <Geom_ConicalSurface.hxx>
@@ -177,7 +178,16 @@ constexpr double analyticTolerance = 1.0e-3;
 /// Try to recover the analytic surface so the viewer can report a diameter.
 void recoverAnalyticSurface(const TopoDS_Face& face, bool reversed, CADFaceRange& range) {
     TopLoc_Location location;
-    const Handle(Geom_Surface) surface = BRep_Tool::Surface(face, location);
+    Handle(Geom_Surface) surface = BRep_Tool::Surface(face, location);
+    // ConvertToAnalytical classifies through GeomAdaptor_Surface, which sees
+    // through a trimmed surface and reports the basis's BSpline/Bezier type,
+    // then down-casts the *trimmed* handle to that type and segments the null
+    // result (OCCT 7.9.3, SIGSEGV in Geom_BSplineSurface::segment). Hand it
+    // the basis surface instead; it shares the trim's parameterisation, so
+    // the face's UV bounds still apply.
+    while (Handle(Geom_RectangularTrimmedSurface) trimmed = Handle(Geom_RectangularTrimmedSurface)::DownCast(surface)) {
+        surface = trimmed->BasisSurface();
+    }
     if (surface.IsNull()) return;
     Standard_Real umin, umax, vmin, vmax;
     BRepTools::UVBounds(face, umin, umax, vmin, vmax);
