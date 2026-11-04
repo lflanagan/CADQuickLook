@@ -10,6 +10,7 @@ final class InteractiveCADView: SCNView {
             axisProbeLength = asset.map {
                 max(Float(CADSceneFactory.fittingRadius(for: $0, around: CADSceneFactory.orbitPivot(for: $0))) * 0.02, 1e-3)
             } ?? 1
+            discardModelState()
         }
     }
     /// Mirrors the scene's display options so picking ignores tangent edges
@@ -72,7 +73,7 @@ final class InteractiveCADView: SCNView {
     /// frame as the model, positioned from the camera actually being rendered.
     /// A plain NSView on top of the SCNView is presented by a separate
     /// pipeline and visibly drifts from the model while zooming or orbiting.
-    private let overlayRenderer = CADOverlayRenderer(hud: CADOverlayScene(size: .zero))
+    private let overlayRenderer = CADOverlayRenderer()
 
     convenience init() {
         self.init(frame: .zero, options: nil)
@@ -89,9 +90,37 @@ final class InteractiveCADView: SCNView {
     }
 
     private func installOverlay() {
-        overlayRenderer.hud.size = bounds.size
-        overlaySKScene = overlayRenderer.hud
-        delegate = overlayRenderer
+        overlayRenderer.install(in: self)
+    }
+
+    /// A new scene means a new model: drop everything that refers to the old
+    /// one so its geometry is freed now rather than at the next hover.
+    override var scene: SCNScene? {
+        didSet {
+            if scene !== oldValue { discardModelState() }
+        }
+    }
+
+    /// Clears all per-model state: hover and pending highlights (whose nodes
+    /// hold the old model's vertex data), measurement points, the zoom
+    /// anchor, and the overlay snapshot the render thread draws from.
+    private func discardModelState() {
+        cameraAnimation?.invalidate()
+        cameraAnimation = nil
+        cachedZoomAnchor = nil
+        if currentHover != nil { NSCursor.arrow.set() }
+        currentHover = nil
+        faceHighlightNode?.removeFromParentNode()
+        faceHighlightNode = nil
+        highlightedEdgePoints = []
+        highlightedVertex = nil
+        pendingFaceNode?.removeFromParentNode()
+        pendingFaceNode = nil
+        pendingEdgePoints = []
+        pendingVertex = nil
+        measurementPoints = []
+        dragPivot = .zero
+        refreshVectorOverlay()
     }
 
     override var acceptsFirstResponder: Bool { true }
@@ -130,7 +159,8 @@ final class InteractiveCADView: SCNView {
 
     override func layout() {
         super.layout()
-        overlayRenderer.hud.size = bounds.size
+        // The render thread resizes the overlay scene from this snapshot;
+        // the main thread never touches the SpriteKit nodes.
         refreshVectorOverlay()
     }
 
@@ -564,16 +594,16 @@ final class InteractiveCADView: SCNView {
 
     private func fitView() {
         guard let asset, let camera = cameraNode, let target = targetNode else { return }
-        let pivot = CADSceneFactory.orbitPivot(for: asset).simdVector
-        let fittingRadius = Float(CADSceneFactory.fittingRadius(for: asset, around: SCNVector3(pivot)))
-        let backward = camera.simdOrientation.act(SIMD3<Float>(0, 0, 1))
-        let distance = fittingRadius * CADSceneFactory.fittingDistanceFactor
-        target.simdPosition = pivot
-        camera.simdPosition = pivot + backward * distance
-        if let cameraGeometry = camera.camera, cameraGeometry.usesOrthographicProjection {
-            let fieldOfViewRadians = Float(cameraGeometry.fieldOfView) * .pi / 180
-            cameraGeometry.orthographicScale = Double(distance * tan(fieldOfViewRadians * 0.5))
-        }
+        let orthographic = camera.camera?.usesOrthographicProjection ?? false
+        let fit = CADSceneFactory.cameraFit(
+            for: asset,
+            orientation: camera.simdOrientation,
+            aspect: bounds.height > 0 ? Float(bounds.width / bounds.height) : 1,
+            orthographic: orthographic
+        )
+        target.simdPosition = fit.target
+        camera.simdPosition = fit.target + camera.simdOrientation.act(SIMD3<Float>(0, 0, 1)) * fit.distance
+        if orthographic { camera.camera?.orthographicScale = fit.orthographicScale }
         cameraDidMove()
     }
 
@@ -736,6 +766,8 @@ final class InteractiveCADView: SCNView {
 
         let skipsTangent = displayOptions.tangentEdges == .removed
         for (edgeIndex, edge) in asset.edges.enumerated() {
+            // Seams and degenerated edges aren't drawn, so they don't snap.
+            if edge.isHidden != 0 { continue }
             if skipsTangent, edge.isTangent != 0 { continue }
             let first = Int(edge.firstPoint)
             let count = Int(edge.pointCount)
@@ -787,13 +819,31 @@ final class InteractiveCADView: SCNView {
             pendingEdgePolyline: pendingEdgePoints.map(\.simdVector),
             pendingVertex: pendingVertex?.simdVector,
             measurement: measurementPoints.map(\.simdVector),
-            axisProbeLength: axisProbeLength
+            axisProbeLength: axisProbeLength,
+            viewportSize: bounds.size
         ))
         // A hover change with a still camera does not dirty the scene, so ask
         // for a frame explicitly.
         setNeedsDisplay(bounds)
     }
 }
+
+// MARK: - Overlay threading
+//
+// The SpriteKit overlay is drawn by SceneKit on its render thread, right
+// after `renderer(_:willRenderScene:atTime:)`, so that callback is the one
+// place its nodes may be mutated:
+//
+// * Main thread: never touches an SKNode (or the SKScene) after
+//   `install(in:)`. It only writes a `CADOverlayModel` (plain Sendable
+//   values: world points, probe length, viewport size) into
+//   `CADOverlayState` under a lock, then asks for a frame.
+// * Render thread: takes the latest model under the lock, projects it
+//   through the presentation camera SceneKit is about to draw with (pure
+//   value code producing a `CADOverlayFrame`), then applies that frame to
+//   the nodes. Mutation and SpriteKit's drawing of the overlay are both on
+//   SceneKit's render pass, which SceneKit serialises, so no node is ever
+//   accessed concurrently, and the triad tracks the exact camera rendered.
 
 /// What the overlay draws, in world coordinates. Immutable snapshot handed
 /// from the main thread to SceneKit's render thread.
@@ -804,6 +854,7 @@ struct CADOverlayModel: Sendable {
     var pendingVertex: SIMD3<Float>?
     var measurement: [SIMD3<Float>] = []
     var axisProbeLength: Float = 1
+    var viewportSize: CGSize = .zero
 }
 
 final class CADOverlayState: @unchecked Sendable {
@@ -823,22 +874,82 @@ final class CADOverlayState: @unchecked Sendable {
     }
 }
 
+/// One frame of the overlay in screen points: the model projected through
+/// the camera being rendered. Plain values, built off the main actor.
+struct CADOverlayFrame: Sendable {
+    struct Axis: Sendable {
+        var line: [CGPoint]
+        var labelCenter: CGPoint
+    }
+
+    var size: CGSize
+    var edge: [CGPoint] = []
+    var pendingEdge: [CGPoint] = []
+    var measurement: [CGPoint] = []
+    var vertex: CGPoint?
+    var pendingVertex: CGPoint?
+    /// nil hides the whole triad (origin behind the camera).
+    var origin: CGPoint?
+    /// One entry per `CADOverlayFrame.axisDirections`; nil hides that axis.
+    var axes: [Axis?] = []
+
+    /// X, Y, Z, in the order of the scene's axis nodes.
+    static let axisDirections: [SIMD3<Float>] = [
+        SIMD3<Float>(1, 0, 0), SIMD3<Float>(0, 1, 0), SIMD3<Float>(0, 0, 1)
+    ]
+
+    init(model: CADOverlayModel, projector: CADScreenProjector, cameraOrientation: simd_quatf) {
+        size = projector.size
+        edge = model.edgePolyline.compactMap { projector.project($0)?.point }
+        pendingEdge = model.pendingEdgePolyline.compactMap { projector.project($0)?.point }
+        measurement = model.measurement.compactMap { projector.project($0)?.point }
+        vertex = model.vertex.flatMap { projector.project($0)?.point }
+        pendingVertex = model.pendingVertex.flatMap { projector.project($0)?.point }
+
+        // The model origin and X/Y/Z axes as a screen-space triad: a fixed
+        // on-screen length, foreshortened by how much each axis points at
+        // the camera.
+        guard let origin = projector.project(.zero)?.point,
+              let reference = projector.project(cameraOrientation.act(SIMD3<Float>(1, 0, 0)) * model.axisProbeLength)
+        else { return }
+        self.origin = origin
+        let referenceLength = hypot(reference.point.x - origin.x, reference.point.y - origin.y)
+        let scale = 56 / max(referenceLength, 0.001)
+        axes = Self.axisDirections.map { direction in
+            guard let tip = projector.project(direction * model.axisProbeLength)?.point else { return nil }
+            let end = CGPoint(x: origin.x + (tip.x - origin.x) * scale, y: origin.y + (tip.y - origin.y) * scale)
+            let dx = end.x - origin.x
+            let dy = end.y - origin.y
+            let length = max(hypot(dx, dy), 0.001)
+            return Axis(line: [origin, end], labelCenter: CGPoint(x: end.x + dx / length * 10, y: end.y + dy / length * 10))
+        }
+    }
+}
+
 /// SceneKit render delegate: just before each frame is drawn, projects the
 /// overlay model through the camera SceneKit is about to render with and
-/// updates the SpriteKit nodes. Runs on the render thread; touches nothing
-/// main-actor.
+/// applies the result to the SpriteKit nodes.
 final class CADOverlayRenderer: NSObject, SCNSceneRendererDelegate, @unchecked Sendable {
     let state = CADOverlayState()
-    let hud: CADOverlayScene
+    /// Only `install(in:)` (before rendering starts) and the render callback
+    /// below touch this.
+    private let hud: CADOverlayScene
 
     @MainActor
-    init(hud: CADOverlayScene) {
-        self.hud = hud
+    override init() {
+        hud = CADOverlayScene(size: .zero)
         super.init()
     }
 
+    @MainActor
+    func install(in view: SCNView) {
+        view.overlaySKScene = hud
+        view.delegate = self
+    }
+
     nonisolated func renderer(_ renderer: any SCNSceneRenderer, willRenderScene scene: SCNScene, atTime time: TimeInterval) {
-        let size = hud.size
+        let model = state.get()
+        let size = model.viewportSize
         guard size.width > 0, size.height > 0,
               let camera = renderer.pointOfView?.presentation,
               let cameraGeometry = camera.camera else { return }
@@ -847,16 +958,31 @@ final class CADOverlayRenderer: NSObject, SCNSceneRendererDelegate, @unchecked S
             projection: simd_float4x4(cameraGeometry.projectionTransform(withViewportSize: size)),
             size: size
         )
-        hud.apply(state.get(), projector: projector, cameraOrientation: camera.simdOrientation)
+        let frame = CADOverlayFrame(model: model, projector: projector, cameraOrientation: camera.simdOrientation)
+        let hud = self.hud
+        Self.inRenderPass { hud.apply(frame) }
+    }
+
+    /// Runs `body` synchronously on the current (render) thread.
+    ///
+    /// SpriteKit marks every SKNode main-actor, but SceneKit draws an
+    /// `overlaySKScene` on its render thread and documents updating it from
+    /// the renderer-delegate callbacks. The overlay's nodes are confined to
+    /// those callbacks (see "Overlay threading" above), which is the
+    /// exclusivity the main-actor annotation otherwise provides, so the
+    /// isolation check is skipped here and only here.
+    /// `MainActor.assumeIsolated` would trap off the main thread.
+    nonisolated private static func inRenderPass(_ body: @MainActor () -> Void) {
+        withoutActuallyEscaping(body) { body in
+            unsafeBitCast(body, to: (() -> Void).self)()
+        }
     }
 }
 
-/// The overlay's SpriteKit nodes. Same look as the previous NSView overlay:
-/// orange strokes and dots, RGB axis triad with labels.
-/// Built on the main thread; afterwards only the render thread touches the
-/// nodes (SceneKit draws the overlay right after `willRenderScene`, on the
-/// same thread, so there is no concurrent access).
-final class CADOverlayScene: SKScene, @unchecked Sendable {
+/// The overlay's SpriteKit nodes: orange strokes and dots, RGB axis triad
+/// with labels. Built on the main thread before it is installed; afterwards
+/// only `apply(_:)`, called from the render pass, touches the nodes.
+final class CADOverlayScene: SKScene {
     private let edgeNode = SKShapeNode()
     private let pendingEdgeNode = SKShapeNode()
     private let measurementLine = SKShapeNode()
@@ -867,10 +993,12 @@ final class CADOverlayScene: SKScene, @unchecked Sendable {
     private var axisLines: [SKShapeNode] = []
     private var axisLabels: [SKLabelNode] = []
     private var axisShadows: [SKLabelNode] = []
-    private static let axes: [(label: String, direction: SIMD3<Float>, color: NSColor)] = [
-        ("X", SIMD3<Float>(1, 0, 0), .systemRed),
-        ("Y", SIMD3<Float>(0, 1, 0), .systemGreen),
-        ("Z", SIMD3<Float>(0, 0, 1), .systemBlue)
+    /// Points each shape node's path was last built from, so unchanged
+    /// paths are not rebuilt every frame.
+    private var lastPathPoints: [ObjectIdentifier: [CGPoint]] = [:]
+    private static let pathTolerance: CGFloat = 0.25
+    private static let axisStyles: [(label: String, color: NSColor)] = [
+        ("X", .systemRed), ("Y", .systemGreen), ("Z", .systemBlue)
     ]
 
     override init(size: CGSize) {
@@ -880,12 +1008,13 @@ final class CADOverlayScene: SKScene, @unchecked Sendable {
         backgroundColor = .clear
         isUserInteractionEnabled = false
 
-        for axis in Self.axes {
+        for axis in Self.axisStyles {
             let line = SKShapeNode()
             line.strokeColor = axis.color
             line.lineWidth = 2
             line.lineCap = .round
             line.isAntialiased = true
+            line.isHidden = true
             axisLines.append(line)
             addChild(line)
             let shadow = SKLabelNode(fontNamed: "Helvetica-Bold")
@@ -893,6 +1022,7 @@ final class CADOverlayScene: SKScene, @unchecked Sendable {
             shadow.fontColor = NSColor.black.withAlphaComponent(0.6)
             shadow.verticalAlignmentMode = .center
             shadow.horizontalAlignmentMode = .center
+            shadow.isHidden = true
             axisShadows.append(shadow)
             addChild(shadow)
             let label = SKLabelNode(fontNamed: "Helvetica-Bold")
@@ -902,11 +1032,13 @@ final class CADOverlayScene: SKScene, @unchecked Sendable {
             label.fontColor = axis.color
             label.verticalAlignmentMode = .center
             label.horizontalAlignmentMode = .center
+            label.isHidden = true
             axisLabels.append(label)
             addChild(label)
         }
         originDot.fillColor = .white
         originDot.strokeColor = .clear
+        originDot.isHidden = true
         addChild(originDot)
 
         for node in [edgeNode, pendingEdgeNode, measurementLine] {
@@ -914,6 +1046,7 @@ final class CADOverlayScene: SKScene, @unchecked Sendable {
             node.lineCap = .round
             node.lineJoin = .round
             node.isAntialiased = true
+            node.isHidden = true
             addChild(node)
         }
         edgeNode.lineWidth = 4
@@ -922,79 +1055,73 @@ final class CADOverlayScene: SKScene, @unchecked Sendable {
         for dot in measurementDots + [vertexDot, pendingVertexDot] {
             dot.fillColor = .systemOrange
             dot.strokeColor = .clear
+            dot.isHidden = true
             addChild(dot)
         }
     }
 
     required init?(coder: NSCoder) { nil }
 
-    nonisolated func apply(_ model: CADOverlayModel, projector: CADScreenProjector, cameraOrientation: simd_quatf) {
-        setPath(edgeNode, model.edgePolyline.compactMap { projector.project($0)?.point })
-        setPath(pendingEdgeNode, model.pendingEdgePolyline.compactMap { projector.project($0)?.point })
-        place(pendingVertexDot, at: model.pendingVertex.flatMap { projector.project($0)?.point })
-        let measurement = model.measurement.compactMap { projector.project($0)?.point }
-        setPath(measurementLine, measurement)
+    /// Render pass only (`CADOverlayRenderer.inRenderPass`). Must not create
+    /// closures (map, forEach, …): they inherit main-actor isolation, and
+    /// Swift traps when one is entered off the main thread.
+    func apply(_ frame: CADOverlayFrame) {
+        if size != frame.size { size = frame.size }
+        setPath(edgeNode, frame.edge)
+        setPath(pendingEdgeNode, frame.pendingEdge)
+        place(pendingVertexDot, at: frame.pendingVertex)
+        setPath(measurementLine, frame.measurement)
         for (index, dot) in measurementDots.enumerated() {
-            place(dot, at: index < measurement.count ? measurement[index] : nil)
+            place(dot, at: index < frame.measurement.count ? frame.measurement[index] : nil)
         }
-        place(vertexDot, at: model.vertex.flatMap { projector.project($0)?.point })
-        applyAxes(model, projector: projector, cameraOrientation: cameraOrientation)
+        place(vertexDot, at: frame.vertex)
+
+        place(originDot, at: frame.origin)
+        for index in axisLines.indices {
+            let axis = frame.origin == nil || index >= frame.axes.count ? nil : frame.axes[index]
+            setPath(axisLines[index], axis?.line ?? [])
+            place(axisLabels[index], at: axis?.labelCenter)
+            // No closures here: this runs on the render thread, and a
+            // main-actor closure checks its isolation on entry and traps.
+            var shadowCenter: CGPoint?
+            if let axis { shadowCenter = CGPoint(x: axis.labelCenter.x + 0.5, y: axis.labelCenter.y - 1) }
+            place(axisShadows[index], at: shadowCenter)
+        }
     }
 
-    /// The model origin and X/Y/Z axes as a screen-space triad: a fixed
-    /// on-screen length, foreshortened by how much each axis points at the camera.
-    nonisolated private func applyAxes(_ model: CADOverlayModel, projector: CADScreenProjector, cameraOrientation: simd_quatf) {
-        guard let origin = projector.project(.zero),
-              let reference = projector.project(cameraOrientation.act(SIMD3<Float>(1, 0, 0)) * model.axisProbeLength)
-        else {
-            for node in axisLines + axisLabels + axisShadows + [originDot] { node.isHidden = true }
+    private func setPath(_ node: SKShapeNode, _ points: [CGPoint]) {
+        guard points.count > 1 else {
+            if !node.isHidden { node.isHidden = true }
             return
         }
-        let referenceLength = hypot(reference.point.x - origin.point.x, reference.point.y - origin.point.y)
-        let scale = 56 / max(referenceLength, 0.001)
-        for (index, axis) in Self.axes.enumerated() {
-            guard let tip = projector.project(axis.direction * model.axisProbeLength) else {
-                axisLines[index].isHidden = true
-                axisLabels[index].isHidden = true
-                axisShadows[index].isHidden = true
-                continue
-            }
-            let end = CGPoint(
-                x: origin.point.x + (tip.point.x - origin.point.x) * scale,
-                y: origin.point.y + (tip.point.y - origin.point.y) * scale
-            )
-            setPath(axisLines[index], [origin.point, end])
-            let dx = end.x - origin.point.x
-            let dy = end.y - origin.point.y
-            let length = max(hypot(dx, dy), 0.001)
-            let labelCenter = CGPoint(x: end.x + dx / length * 10, y: end.y + dy / length * 10)
-            axisLabels[index].position = labelCenter
-            axisLabels[index].isHidden = false
-            axisShadows[index].position = CGPoint(x: labelCenter.x + 0.5, y: labelCenter.y - 1)
-            axisShadows[index].isHidden = false
-        }
-        place(originDot, at: origin.point)
-    }
-
-    nonisolated private func setPath(_ node: SKShapeNode, _ points: [CGPoint]) {
-        guard points.count > 1 else {
-            node.isHidden = true
+        let key = ObjectIdentifier(node)
+        if let last = lastPathPoints[key], node.path != nil, Self.isClose(last, points) {
+            if node.isHidden { node.isHidden = false }
             return
         }
         let path = CGMutablePath()
         path.move(to: points[0])
         for point in points.dropFirst() { path.addLine(to: point) }
         node.path = path
-        node.isHidden = false
+        lastPathPoints[key] = points
+        if node.isHidden { node.isHidden = false }
     }
 
-    nonisolated private func place(_ node: SKNode, at point: CGPoint?) {
+    private static func isClose(_ a: [CGPoint], _ b: [CGPoint]) -> Bool {
+        guard a.count == b.count else { return false }
+        for (p, q) in zip(a, b) where abs(p.x - q.x) > pathTolerance || abs(p.y - q.y) > pathTolerance {
+            return false
+        }
+        return true
+    }
+
+    private func place(_ node: SKNode, at point: CGPoint?) {
         guard let point else {
-            node.isHidden = true
+            if !node.isHidden { node.isHidden = true }
             return
         }
-        node.position = point
-        node.isHidden = false
+        if node.position != point { node.position = point }
+        if node.isHidden { node.isHidden = false }
     }
 }
 

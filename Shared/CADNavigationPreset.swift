@@ -244,6 +244,10 @@ enum CADPreferences {
     static let measurementPrecisionKey = "measurementPrecision"
     static let showsMeasurementDetailsKey = "showsMeasurementDetails"
     static let opensFilesInNewWindowKey = "opensFilesInNewWindow"
+    static let modelCacheEnabledKey = "modelCacheEnabled"
+    static let modelCacheLimitKey = "modelCacheLimitGigabytes"
+    /// Model cache size limits offered in Settings, in gigabytes.
+    static let modelCacheLimitChoices = [1, 2, 5, 10]
 
     /// App Group shared by the app and both Quick Look extensions. The
     /// identifier is expanded into Info.plist from the signing team at build
@@ -345,6 +349,26 @@ enum CADPreferences {
 
     static func setOpensFilesInNewWindow(_ opens: Bool) {
         defaults.set(opens, forKey: opensFilesInNewWindowKey)
+    }
+
+    /// Whether slow-to-load models are kept in the on-disk model cache.
+    /// Read by the app and the Quick Look extensions (App Group defaults).
+    static var modelCacheEnabled: Bool {
+        defaults.object(forKey: modelCacheEnabledKey) as? Bool ?? true
+    }
+
+    static func setModelCacheEnabled(_ enabled: Bool) {
+        defaults.set(enabled, forKey: modelCacheEnabledKey)
+    }
+
+    /// The model cache's size limit in gigabytes (one of modelCacheLimitChoices).
+    static var modelCacheLimitGigabytes: Int {
+        let value = defaults.integer(forKey: modelCacheLimitKey)
+        return modelCacheLimitChoices.contains(value) ? value : 2
+    }
+
+    static func setModelCacheLimitGigabytes(_ gigabytes: Int) {
+        defaults.set(gigabytes, forKey: modelCacheLimitKey)
     }
 
     static var pairMeasure: CADPairMeasure {

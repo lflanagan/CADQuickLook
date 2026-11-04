@@ -3,6 +3,11 @@ import SwiftUI
 
 @MainActor
 final class CADApplicationDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // Old app versions' cache directories, expired and over-limit entries.
+        CADModelCache.performLaunchMaintenance()
+    }
+
     func application(_ sender: NSApplication, openFiles filenames: [String]) {
         filenames.map(URL.init(fileURLWithPath:)).forEach(CADWindowRouter.shared.open)
         sender.reply(toOpenOrPrint: .success)

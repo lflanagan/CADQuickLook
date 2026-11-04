@@ -43,6 +43,11 @@ struct DXFDrawing {
     /// Layer name → colour, from the TABLES section.
     private var layerColors: [String: SIMD3<Float>] = [:]
     private static let maximumTexts = 5_000
+    /// Each glyph costs several KB of SceneKit geometry, so text is capped by
+    /// length as well as count.
+    private static let maximumCharactersPerText = 10_000
+    private static let maximumTextCharacters = 200_000
+    private var textCharacters = 0
 
     enum ParseError: LocalizedError {
         case unreadable
@@ -83,7 +88,19 @@ struct DXFDrawing {
     /// Upper bounds so a malformed or hostile file cannot exhaust memory.
     private static let maximumEdges = 500_000
     private static let maximumPoints = 20_000_000
+    /// Entities visited, including block contents once per INSERT, so that
+    /// nested inserts of point-less entities (text, unsupported types) cannot
+    /// fan out without bound.
+    private static let maximumEntityVisits = 2_000_000
     private var pointCount = 0
+    private var entityVisits = 0
+    /// Blocks being expanded, to skip an INSERT that would recurse into itself.
+    private var activeBlocks: Set<String> = []
+
+    /// True once any budget is spent: no further geometry is parsed.
+    private var budgetExhausted: Bool {
+        edges.count >= Self.maximumEdges || pointCount >= Self.maximumPoints || entityVisits >= Self.maximumEntityVisits
+    }
 
     /// Int conversion that never traps: non-finite values map to the lower bound.
     private static func clampedInt(_ value: Double, _ range: ClosedRange<Int>) -> Int {
@@ -128,7 +145,7 @@ struct DXFDrawing {
                     while index < pairs.count, pairs[index].code != 0 {
                         switch pairs[index].code {
                         case 2: name = pairs[index].value
-                        case 62: if color == nil, let aci = Int(pairs[index].value) { color = Self.color(aci: abs(aci)) }
+                        case 62: if color == nil, let aci = Int(pairs[index].value) { color = Self.color(aci: Int(clamping: aci.magnitude)) }
                         case 420: if let rgb = Int(pairs[index].value) { color = Self.color(trueColor: rgb) }
                         default: break
                         }
@@ -285,20 +302,26 @@ struct DXFDrawing {
     private mutating func append(_ entity: Entity, transform: Transform, depth: Int) {
         // Budget against block-reference fan-out (a block inserting itself N times
         // is N^depth entities) and absurd sample counts.
-        guard edges.count < Self.maximumEdges, pointCount < Self.maximumPoints else { return }
+        guard !budgetExhausted else { return }
+        entityVisits += 1
         // Entities with a flipped extrusion direction (OCS Z = -1) are mirrored in X.
         let mirrored = entity.value(230, default: 1) < 0
         let entityColor = color(of: entity, transform: transform)
+        // Points the budget still allows; generators stop once they reach it.
+        let pointLimit = Self.maximumPoints - pointCount
         func emit(_ points: [SIMD2<Double>], circular: Bool = false, diameter: Double = 0, length: Double? = nil) {
-            guard points.count > 1, points.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else { return }
-            var mapped = points
-            if mirrored { mapped = mapped.map { SIMD2<Double>(-$0.x, $0.y) } }
-            mapped = mapped.map(transform.apply)
+            let remaining = Self.maximumPoints - pointCount
+            guard edges.count < Self.maximumEdges, points.count > 1, remaining > 1 else { return }
+            // Keep what fits in the point budget; a cut-off edge spends it all.
+            let truncated = points.count > remaining
+            let kept = points.prefix(remaining)
+            guard kept.allSatisfy({ $0.x.isFinite && $0.y.isFinite }) else { return }
+            let mapped = kept.map { transform.apply(mirrored ? SIMD2<Double>(-$0.x, $0.y) : $0) }
             let polylineLength = zip(mapped, mapped.dropFirst()).reduce(0.0) { $0 + simd_length($1.1 - $1.0) }
-            let exact = (length.map { $0 * transform.lengthScale }) ?? polylineLength
+            let exact = truncated ? polylineLength : ((length.map { $0 * transform.lengthScale }) ?? polylineLength)
             guard mapped.allSatisfy({ $0.x.isFinite && $0.y.isFinite }), exact.isFinite else { return }
-            let keepCircular = circular && transform.isUniform
-            pointCount += mapped.count
+            let keepCircular = circular && !truncated && transform.isUniform
+            pointCount = truncated ? Self.maximumPoints : pointCount + mapped.count
             edges.append(DXFEdge(
                 points: mapped,
                 isCircular: keepCircular,
@@ -326,8 +349,10 @@ struct DXFDrawing {
             let start = entity.value(50) * .pi / 180
             var end = entity.value(51) * .pi / 180
             if end <= start { end += 2 * .pi }
-            emit(Self.arcPoints(center: center, radius: radius, start: start, sweep: end - start),
-                 circular: true, diameter: radius * 2, length: radius * (end - start))
+            // Angles near 1e300 swamp the 2π correction; keep the sweep a real arc.
+            let sweep = min(max(end - start, 0), 2 * .pi)
+            emit(Self.arcPoints(center: center, radius: radius, start: start, sweep: sweep),
+                 circular: true, diameter: radius * 2, length: radius * sweep)
 
         case "LWPOLYLINE":
             var vertices: [(SIMD2<Double>, Double)] = []
@@ -349,7 +374,7 @@ struct DXFDrawing {
             }
             if let current { vertices.append((current, 0)) }
             let closed = (Self.clampedInt(entity.value(70), 0...Int(Int32.max)) & 1) != 0
-            appendPolyline(vertices, closed: closed, emit: emit)
+            appendPolyline(vertices, closed: closed, limit: pointLimit, emit: emit)
 
         case "POLYLINE":
             let vertices: [(SIMD2<Double>, Double)] = entity.vertices.compactMap { vertex in
@@ -362,7 +387,7 @@ struct DXFDrawing {
                 return (SIMD2<Double>(x, y), bulge)
             }
             let closed = (Self.clampedInt(entity.value(70), 0...Int(Int32.max)) & 1) != 0
-            appendPolyline(vertices, closed: closed, emit: emit)
+            appendPolyline(vertices, closed: closed, limit: pointLimit, emit: emit)
 
         case "ELLIPSE":
             let center = SIMD2<Double>(entity.value(10), entity.value(20))
@@ -381,10 +406,13 @@ struct DXFDrawing {
             emit(points)
 
         case "SPLINE":
-            emit(Self.splinePoints(entity))
+            emit(Self.splinePoints(entity, limit: pointLimit))
 
         case "INSERT":
-            guard depth < 8, let name = entity.string(2), let block = blocks[name] else { return }
+            guard depth < 8, let name = entity.string(2), let block = blocks[name],
+                  !activeBlocks.contains(name) else { return }
+            activeBlocks.insert(name)
+            defer { activeBlocks.remove(name) }
             var nested = Transform()
             nested.base = block.base
             nested.origin = SIMD2<Double>(entity.value(10), entity.value(20))
@@ -399,16 +427,21 @@ struct DXFDrawing {
             composed.base = block.base
             composed.blockColor = entityColor ?? transform.blockColor
             for child in block.entities {
+                guard !budgetExhausted else { break }
                 append(child, transform: composed, depth: depth + 1)
             }
 
         case "DIMENSION":
             // A dimension's lines, arrows and text live in its anonymous block
             // (*D12), already in drawing coordinates.
-            guard depth < 8, let name = entity.string(2), let block = blocks[name] else { return }
+            guard depth < 8, let name = entity.string(2), let block = blocks[name],
+                  !activeBlocks.contains(name) else { return }
+            activeBlocks.insert(name)
+            defer { activeBlocks.remove(name) }
             var composed = transform
             composed.blockColor = entityColor ?? transform.blockColor
             for child in block.entities {
+                guard !budgetExhausted else { break }
                 append(child, transform: composed, depth: depth + 1)
             }
 
@@ -419,7 +452,7 @@ struct DXFDrawing {
             appendMText(entity, transform: transform, color: entityColor)
 
         case "HATCH":
-            for loop in Self.hatchBoundaries(entity) {
+            for loop in Self.hatchBoundaries(entity, limit: pointLimit) {
                 emit(loop)
             }
 
@@ -431,12 +464,12 @@ struct DXFDrawing {
     // MARK: - Text
 
     private mutating func appendText(_ entity: Entity, transform: Transform, mirrored: Bool, color: SIMD3<Float>?) {
-        guard texts.count < Self.maximumTexts, var text = entity.string(1), !text.isEmpty else { return }
-        text = Self.plainText(text)
+        guard texts.count < Self.maximumTexts, let raw = entity.string(1), !raw.isEmpty,
+              let text = limitedText(raw) else { return }
         let height = entity.value(40) * transform.lengthScale
         guard height > 0, height.isFinite else { return }
-        let horizontal = Int(entity.value(72))
-        let vertical = Int(entity.value(73))
+        let horizontal = Self.clampedInt(entity.value(72), Int(Int32.min)...Int(Int32.max))
+        let vertical = Self.clampedInt(entity.value(73), Int(Int32.min)...Int(Int32.max))
         // Left-baseline text anchors at 10/20; every other justification at 11/21.
         let aligned = horizontal != 0 || vertical != 0
         var point = aligned
@@ -454,6 +487,7 @@ struct DXFDrawing {
         case 3: 2           // top
         default: 0          // baseline / bottom
         }
+        textCharacters += text.count
         texts.append(DXFText(
             text: text,
             position: transform.apply(point),
@@ -466,15 +500,20 @@ struct DXFDrawing {
     }
 
     private mutating func appendMText(_ entity: Entity, transform: Transform, color: SIMD3<Float>?) {
-        guard texts.count < Self.maximumTexts else { return }
+        guard texts.count < Self.maximumTexts, textCharacters < Self.maximumTextCharacters else { return }
         // Long MTEXT is split into 250-character chunks in code 3, then code 1.
-        var raw = entity.pairs.filter { $0.code == 3 }.map(\.value).joined()
-        raw += entity.string(1) ?? ""
-        let text = Self.plainText(raw)
-        guard !text.isEmpty else { return }
+        // Stop joining once there is more raw text than could be displayed.
+        let rawLimit = Self.maximumCharactersPerText * 4
+        var raw = ""
+        for pair in entity.pairs where pair.code == 3 {
+            guard raw.utf8.count < rawLimit else { break }
+            raw += pair.value
+        }
+        if raw.utf8.count < rawLimit { raw += entity.string(1) ?? "" }
+        guard let text = limitedText(raw), !text.isEmpty else { return }
         let height = entity.value(40) * transform.lengthScale
         guard height > 0, height.isFinite else { return }
-        let attachment = Int(entity.value(71, default: 1))
+        let attachment = Self.clampedInt(entity.value(71, default: 1), 1...9)
         let anchorH = (attachment - 1) % 3          // 0 left, 1 centre, 2 right
         let row = (attachment - 1) / 3               // 0 top, 1 middle, 2 bottom
         let anchorV = row == 0 ? 2 : (row == 1 ? 1 : 0)
@@ -482,6 +521,7 @@ struct DXFDrawing {
         var rotation = entity.value(50) * .pi / 180
         let axis = SIMD2<Double>(entity.value(11), entity.value(21))
         if simd_length(axis) > 1e-9 { rotation = atan2(axis.y, axis.x) }
+        textCharacters += text.count
         texts.append(DXFText(
             text: text,
             position: transform.apply(SIMD2<Double>(entity.value(10), entity.value(20))),
@@ -491,6 +531,17 @@ struct DXFDrawing {
             verticalAnchor: anchorV,
             color: color
         ))
+    }
+
+    /// Display text for `raw`, cut to the per-text and remaining total
+    /// character budgets; nil once the total budget is spent.
+    private func limitedText(_ raw: String) -> String? {
+        let allowed = min(Self.maximumCharactersPerText, Self.maximumTextCharacters - textCharacters)
+        guard allowed > 0 else { return nil }
+        // Formatting codes shrink the text, so only bound the raw input loosely.
+        var text = Self.plainText(String(raw.prefix(Self.maximumCharactersPerText * 4)))
+        if text.count > allowed { text = String(text.prefix(allowed)) }
+        return text
     }
 
     /// Strips MTEXT inline formatting (\P paragraph, \f font, \H height, {}
@@ -543,9 +594,11 @@ struct DXFDrawing {
 
     // MARK: - Hatch
 
-    /// Boundary loops of a HATCH as polylines (no fill).
-    private static func hatchBoundaries(_ entity: Entity) -> [[SIMD2<Double>]] {
+    /// Boundary loops of a HATCH as polylines (no fill), stopping once about
+    /// `limit` points have been produced.
+    private static func hatchBoundaries(_ entity: Entity, limit: Int) -> [[SIMD2<Double>]] {
         var loops: [[SIMD2<Double>]] = []
+        var total = 0
         let pairs = entity.pairs
         var i = 0
         func next(_ code: Int) -> Double? {
@@ -558,20 +611,24 @@ struct DXFDrawing {
         }
         // Skip to the boundary-path count.
         guard let pathCount = next(91) else { return [] }
-        for _ in 0..<min(Int(pathCount), 10_000) {
-            guard let flags = next(92) else { break }
-            let isPolyline = Int(flags) & 2 != 0
+        paths: for _ in 0..<clampedInt(pathCount, 0...10_000) {
+            guard total < limit, let flags = next(92) else { break }
+            let isPolyline = clampedInt(flags, 0...Int(Int32.max)) & 2 != 0
             if isPolyline {
                 let hasBulge = (next(72) ?? 0) != 0
                 guard let count = next(93) else { break }
                 var vertices: [(SIMD2<Double>, Double)] = []
-                for _ in 0..<min(Int(count), 100_000) {
+                for _ in 0..<clampedInt(count, 0...100_000) {
                     guard let x = next(10), let y = next(20) else { break }
                     let bulge = hasBulge ? (next(42) ?? 0) : 0
                     vertices.append((SIMD2<Double>(x, y), bulge))
                 }
                 var points: [SIMD2<Double>] = []
                 for (index, (a, bulge)) in vertices.enumerated() {
+                    if total + points.count >= limit {
+                        loops.append(points)
+                        break paths
+                    }
                     let b = vertices[(index + 1) % vertices.count].0
                     if abs(bulge) < 1e-12 || simd_length(b - a) == 0 {
                         points.append(a)
@@ -588,13 +645,18 @@ struct DXFDrawing {
                     }
                 }
                 if let first = points.first { points.append(first) }
+                total += points.count
                 loops.append(points)
             } else {
                 guard let edgeCount = next(93) else { break }
                 var points: [SIMD2<Double>] = []
-                for _ in 0..<min(Int(edgeCount), 100_000) {
+                for _ in 0..<clampedInt(edgeCount, 0...100_000) {
+                    if total + points.count >= limit {
+                        if points.count > 1 { loops.append(points) }
+                        break paths
+                    }
                     guard let type = next(72) else { break }
-                    switch Int(type) {
+                    switch clampedInt(type, 0...255) {
                     case 1:
                         guard let x0 = next(10), let y0 = next(20), let x1 = next(11), let y1 = next(21) else { break }
                         points.append(SIMD2<Double>(x0, y0))
@@ -617,7 +679,8 @@ struct DXFDrawing {
                         var sweep = (end - start) * .pi / 180
                         if sweep <= 0 { sweep += 2 * .pi }
                         if !ccw { sweep = -sweep }
-                        let steps = max(8, Int(abs(sweep) / (.pi / 24)))
+                        sweep = min(max(sweep, -2 * .pi), 2 * .pi)
+                        let steps = clampedInt(abs(sweep) / (.pi / 24), 8...720)
                         for step in 0...steps {
                             let t = start * .pi / 180 + sweep * Double(step) / Double(steps)
                             points.append(SIMD2<Double>(cx, cy) + major * cos(t) + minor * sin(t))
@@ -625,10 +688,10 @@ struct DXFDrawing {
                     case 4:
                         // Spline edge: degree, rational, periodic, knot count, control count, then knots/controls.
                         _ = next(94); _ = next(73); _ = next(74)
-                        let knotCount = Int(next(95) ?? 0)
-                        let controlCount = Int(next(96) ?? 0)
-                        for _ in 0..<min(knotCount, 100_000) { _ = next(40) }
-                        for _ in 0..<min(controlCount, 100_000) {
+                        let knotCount = clampedInt(next(95) ?? 0, 0...100_000)
+                        let controlCount = clampedInt(next(96) ?? 0, 0...100_000)
+                        for _ in 0..<knotCount { _ = next(40) }
+                        for _ in 0..<controlCount {
                             guard let x = next(10), let y = next(20) else { break }
                             points.append(SIMD2<Double>(x, y))
                         }
@@ -636,10 +699,11 @@ struct DXFDrawing {
                         break
                     }
                 }
+                total += points.count
                 if points.count > 1 { loops.append(points) }
             }
             // Skip this path's source-boundary object handles.
-            if let count = next(97) { for _ in 0..<min(Int(count), 100_000) { _ = next(330) } }
+            if let count = next(97) { for _ in 0..<clampedInt(count, 0...100_000) { _ = next(330) } }
         }
         return loops
     }
@@ -680,6 +744,7 @@ struct DXFDrawing {
     private func appendPolyline(
         _ vertices: [(SIMD2<Double>, Double)],
         closed: Bool,
+        limit: Int,
         emit: ([SIMD2<Double>], Bool, Double, Double?) -> Void
     ) {
         guard vertices.count > 1 else { return }
@@ -696,6 +761,8 @@ struct DXFDrawing {
         var length = 0.0
         let count = closed ? vertices.count : vertices.count - 1
         for i in 0..<count {
+            // Past the point budget: stop sampling; emit keeps what fits.
+            guard points.count <= limit else { break }
             let (a, bulge) = vertices[i]
             let b = vertices[(i + 1) % vertices.count].0
             if abs(bulge) < 1e-12 {
@@ -730,7 +797,8 @@ struct DXFDrawing {
 
     /// Evaluates a NURBS spline from its control points and knots; falls back
     /// to the fit points when no control data is present.
-    private static func splinePoints(_ entity: Entity) -> [SIMD2<Double>] {
+    private static func splinePoints(_ entity: Entity, limit: Int) -> [SIMD2<Double>] {
+        guard limit > 1 else { return [] }
         let degree = Self.clampedInt(entity.value(71, default: 3), 1...11)
         let knots = entity.values(40)
         let xs = entity.values(10), ys = entity.values(20)
@@ -740,13 +808,14 @@ struct DXFDrawing {
 
         guard control.count > degree, knots.count == control.count + degree + 1 else {
             let fx = entity.values(11), fy = entity.values(21)
-            return zip(fx, fy).map { SIMD2<Double>($0, $1) }
+            return zip(fx, fy).prefix(limit).map { SIMD2<Double>($0, $1) }
         }
 
         let spans = control.count - degree
         let samples = min(max(16, spans * 12), 20_000)
         let tMin = knots[degree], tMax = knots[control.count]
-        return (0...samples).map { i in
+        // The first `limit` samples when the budget is short (emit would cut them anyway).
+        return (0...min(samples, limit - 1)).map { i in
             let t = tMin + (tMax - tMin) * Double(i) / Double(samples)
             return deBoor(t: t, degree: degree, knots: knots, control: control, weights: weights)
         }
@@ -754,8 +823,13 @@ struct DXFDrawing {
 
     private static func deBoor(t: Double, degree: Int, knots: [Double], control: [SIMD2<Double>], weights: [Double]) -> SIMD2<Double> {
         let n = control.count
-        var k = degree
-        while k < n - 1, t >= knots[k + 1] { k += 1 }
+        // Knot span: the first k in degree..<n-1 with t < knots[k + 1], else n - 1
+        // (binary search over the non-decreasing knots).
+        var k = degree, upper = n - 1
+        while k < upper {
+            let mid = (k + upper) / 2
+            if t >= knots[mid + 1] { k = mid + 1 } else { upper = mid }
+        }
         var d: [SIMD3<Double>] = (0...degree).map { j in
             let index = k - degree + j
             return SIMD3<Double>(control[index].x * weights[index], control[index].y * weights[index], weights[index])

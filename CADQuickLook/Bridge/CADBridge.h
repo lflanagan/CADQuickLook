@@ -20,7 +20,13 @@ typedef enum CADBridgeStatus {
     CADBridgeStatusMeshingFailed = 5,
     CADBridgeStatusOutOfRange = 6,
     CADBridgeStatusMeasurementFailed = 7,
-    CADBridgeStatusInternalError = 8
+    CADBridgeStatusInternalError = 8,
+    /// The load was stopped through its cancel token (window closed, file replaced).
+    CADBridgeStatusCancelled = 9,
+    /// The load was stopped because it would exceed a memory or size limit
+    /// (the token's memory budget, or the triangle/edge budget). The model
+    /// is too complex to display; the error message says which limit.
+    CADBridgeStatusResourceLimit = 10
 } CADBridgeStatus;
 
 typedef struct CADMeshOptions {
@@ -37,11 +43,24 @@ typedef struct CADMeshOptions {
     /// Multiplier applied to the automatic linear deflection (values <= 0
     /// mean 1). Thumbnails use a coarser mesh to load faster.
     double linearDeflectionScale;
-    /// Run Open CASCADE's shape-healing pass during STEP translation (0 or 1).
-    /// Healing costs ~25% of load time on large assemblies and is rarely
-    /// needed for files from modern exporters.
-    uint8_t healShapes;
 } CADMeshOptions;
+
+/// Stops a load in progress, and caps the memory a load may use. Tokens are
+/// reference counted and independent of the model, so a host can cancel
+/// from any thread while (or after) the model is destroyed.
+typedef struct CADBridgeCancelToken CADBridgeCancelToken;
+
+/// Creates a token holding one reference. `memoryBudgetBytes` is the
+/// process footprint (phys_footprint) above which a load stops with
+/// CADBridgeStatusResourceLimit; 0 means no memory budget. The budget also
+/// scales the triangle and edge-point limits.
+CADBridgeCancelToken *CADBridgeCancelTokenCreate(uint64_t memoryBudgetBytes);
+/// Requests that any load using this token stop as soon as it can. Thread-safe.
+void CADBridgeCancelTokenCancel(CADBridgeCancelToken *token);
+/// Drops one reference.
+void CADBridgeCancelTokenRelease(CADBridgeCancelToken *token);
+/// Uses `token` (retained) for subsequent loads; NULL clears it.
+void CADBridgeModelSetCancelToken(CADBridgeModel *model, CADBridgeCancelToken *token);
 
 typedef enum CADLoadStage {
     CADLoadStageReading = 0,
@@ -130,6 +149,11 @@ typedef struct CADEdgePolyline {
     uint8_t isTangent;
     /// Analytic classification of the underlying curve (CADCurveType).
     uint8_t curveType;
+    /// 1 when the edge is never drawn as a line: a seam, where a periodic
+    /// surface (cylinder, torus...) meets itself, or a degenerated edge (the
+    /// collapsed pole of a sphere or cone). Kept in the table so edge indices
+    /// and measurement stay valid. Occupies padding, so the size is unchanged.
+    uint8_t isHidden;
     /// Line: unit direction. Circle: unit axis (normal of the circle's plane).
     CADPoint3D direction;
 } CADEdgePolyline;
@@ -190,6 +214,34 @@ void CADBridgeModelReleaseDisplayData(CADBridgeModel *model);
 /// Returns freed malloc pages to the kernel. Called automatically after
 /// CADBridgeModelReleaseDisplayData() and CADBridgeModelDestroy().
 void CADBridgeTrimMemory(void);
+
+/// Serialises the model's exact B-Rep (without tessellation) for the model
+/// cache, in Open CASCADE's binary format. Works before or after
+/// CADBridgeModelReleaseDisplayData(). Returns a buffer the caller frees with
+/// CADBridgeFree(), or NULL (no shape, e.g. STL, or a serialisation error).
+uint8_t *CADBridgeModelCopyShapeData(const CADBridgeModel *model, size_t *outLength);
+
+/// Frees memory returned by the bridge (CADBridgeModelCopyShapeData).
+void CADBridgeFree(void *data);
+
+/// Rebuilds a loaded model from a cache entry: the B-Rep bytes from
+/// CADBridgeModelCopyShapeData() plus the face and edge tables, bounds and
+/// stats saved with them. Face/edge order is the bridge's enumeration order,
+/// so measurement indices stay valid. Returns CADBridgeStatusImportFailed if
+/// the bytes do not parse or the shape's face/edge counts differ from the
+/// tables (a corrupt or incompatible entry; the host should delete it and
+/// load the file normally). The display arrays (vertices, triangles,
+/// polylines) stay empty; the host keeps its own copies.
+CADBridgeStatus CADBridgeModelRestore(CADBridgeModel *model,
+                                      const uint8_t *shapeData, size_t shapeLength,
+                                      const CADFaceRange *faceRanges, size_t faceCount,
+                                      const CADEdgePolyline *edges, size_t edgeCount,
+                                      CADBounds bounds, CADModelStats stats);
+
+/// Identifies everything that determines the bridge's output for a given
+/// file and options (bridge output revision, Open CASCADE version, struct
+/// layouts). Cache keys include it so a changed bridge never reads an old entry.
+const char *CADBridgeCacheVersion(void);
 
 /// Loads and tessellates STEP/STP, IGES/IGS, BREP, or STL. Loading another file
 /// replaces all prior shape and display data. The path must be UTF-8.

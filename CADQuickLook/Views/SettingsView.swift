@@ -6,6 +6,10 @@ struct SettingsView: View {
     @State private var cameraProjectionRawValue = CADPreferences.cameraProjection.rawValue
     @State private var lengthUnitRawValue = CADPreferences.lengthUnit.rawValue
     @State private var opensInNewWindow = CADPreferences.opensFilesInNewWindow
+    @State private var modelCacheEnabled = CADPreferences.modelCacheEnabled
+    @State private var modelCacheLimit = CADPreferences.modelCacheLimitGigabytes
+    /// Allocated bytes, or nil while being measured.
+    @State private var modelCacheSize: Int64?
 
     private var navigationPreset: CADNavigationPreset {
         CADNavigationPreset(rawValue: navigationPresetRawValue) ?? .onshape
@@ -56,6 +60,27 @@ struct SettingsView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            Section("Model cache") {
+                Toggle("Cache processed models", isOn: $modelCacheEnabled)
+                Picker("Maximum size", selection: $modelCacheLimit) {
+                    ForEach(CADPreferences.modelCacheLimitChoices, id: \.self) { gigabytes in
+                        Text("\(gigabytes) GB").tag(gigabytes)
+                    }
+                }
+                .pickerStyle(.menu)
+                .disabled(!modelCacheEnabled)
+                LabeledContent(modelCacheSizeText) {
+                    Button("Clear Cache") {
+                        updateModelCache { $0.removeAll() }
+                    }
+                    .disabled(modelCacheSize == 0)
+                }
+                Text("Large models open instantly the second time. The cache is limited to the chosen size and never stores file names.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
             Section("Updates") {
                 Toggle("Check for updates automatically", isOn: $updater.automaticallyChecksForUpdates)
 
@@ -92,11 +117,41 @@ struct SettingsView: View {
             guard let unit = CADLengthUnit(rawValue: rawValue) else { return }
             CADPreferences.setLengthUnit(unit)
         }
+        .onChange(of: modelCacheEnabled) { _, enabled in
+            CADPreferences.setModelCacheEnabled(enabled)
+            if !enabled { updateModelCache { $0.removeAll() } }
+        }
+        .onChange(of: modelCacheLimit) { _, gigabytes in
+            CADPreferences.setModelCacheLimitGigabytes(gigabytes)
+            updateModelCache { $0.evict() }
+        }
         .onAppear {
             updater.refresh()
+            modelCacheEnabled = CADPreferences.modelCacheEnabled
+            modelCacheLimit = CADPreferences.modelCacheLimitGigabytes
+            updateModelCache { _ in }
             navigationPresetRawValue = CADPreferences.navigationPreset.rawValue
             cameraProjectionRawValue = CADPreferences.cameraProjection.rawValue
             lengthUnitRawValue = CADPreferences.lengthUnit.rawValue
+        }
+    }
+
+    private var modelCacheSizeText: String {
+        switch modelCacheSize {
+        case nil: "Measuring…"
+        case 0: "Empty"
+        case let bytes?: "Using \(bytes.formatted(.byteCount(style: .file)))"
+        }
+    }
+
+    /// Runs `change` on the cache off the main thread, then re-measures it.
+    private func updateModelCache(_ change: @escaping @Sendable (CADModelCache) -> Void) {
+        Task {
+            modelCacheSize = await Task.detached(priority: .utility) {
+                guard let cache = CADModelCache.shared else { return Int64(0) }
+                change(cache)
+                return cache.size()
+            }.value
         }
     }
 }
