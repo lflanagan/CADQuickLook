@@ -18,6 +18,12 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
         didSet { cubeView.onSnapCorner = onSnapCorner }
     }
     var onProjectionChange: ((CADCameraProjection) -> Void)?
+    /// Opens the full Settings window. When set, the menu ends with a
+    /// "Settings…" item; Quick Look leaves it nil (the app's Settings window
+    /// isn't reachable from the preview panel).
+    var onOpenSettings: (() -> Void)? {
+        didSet { rebuildMenu() }
+    }
     /// 2D drawings have a fixed top-down view, so the cube is hidden.
     var isPlanar = false {
         didSet { cubeView.isHidden = isPlanar }
@@ -128,6 +134,13 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
         navigation.submenu?.addItem(.separator())
         for choice in CADOrbitPivotMode.allCases {
             navigation.submenu?.addItem(choiceItem(prefix: "pivot", rawValue: choice.rawValue, title: choice.title))
+        }
+        if onOpenSettings != nil {
+            menu.addItem(.separator())
+            let settings = NSMenuItem(title: "Settings…", action: #selector(openSettings(_:)), keyEquivalent: "")
+            settings.target = self
+            settings.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
+            menu.addItem(settings)
         }
 
         refreshChecks(in: menu)
@@ -243,6 +256,11 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
     func menuWillOpen(_ menu: NSMenu) {
         onProjectionChange?(CADPreferences.cameraProjection)
         refreshChecks(in: menu)
+    }
+
+    @objc private func openSettings(_ sender: NSMenuItem) {
+        viewsButton.selectItem(at: 0)
+        onOpenSettings?()
     }
 
     @objc private func selectChoice(_ sender: NSMenuItem) {

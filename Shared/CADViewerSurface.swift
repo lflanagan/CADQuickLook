@@ -34,6 +34,21 @@ final class CADViewerSurface: NSView {
         }
     }
 
+    /// Shows the file icon and name in the title strip. Quick Look's panel
+    /// already titles itself with the file name, so the preview turns this off.
+    var showsFileName = true {
+        didSet {
+            fileIcon.isHidden = !showsFileName || fileIcon.image == nil
+            fileNameLabel.isHidden = !showsFileName
+        }
+    }
+
+    /// Opens the full Settings window from the view menu (app only).
+    var onOpenSettings: (() -> Void)? {
+        get { viewCube.onOpenSettings }
+        set { viewCube.onOpenSettings = newValue }
+    }
+
     private(set) var representedURL: URL?
 
     override init(frame frameRect: NSRect) {
@@ -80,7 +95,7 @@ final class CADViewerSurface: NSView {
         representedURL = asset.url
         fileNameLabel.stringValue = asset.url.lastPathComponent
         fileIcon.image = NSWorkspace.shared.icon(forFile: asset.url.path)
-        fileIcon.isHidden = false
+        fileIcon.isHidden = !showsFileName
         let options = CADPreferences.displayOptions
         let scene = CADSceneFactory.makeScene(for: asset, options: options)
         sceneView.scene = scene

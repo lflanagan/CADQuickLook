@@ -18,15 +18,20 @@ enum CADModelError: LocalizedError {
 
 /// Load progress reported while a model is being imported and tessellated.
 struct CADLoadProgress: Sendable, Equatable {
-    enum Stage: Sendable { case reading, translating, meshing, buildingMesh, samplingEdges, finishing }
+    enum Stage: Sendable { case queued, openingCache, reading, translating, meshing, buildingMesh, samplingEdges, finishing }
     let stage: Stage
     /// 0...1, or nil when the stage has no measurable progress.
     let fraction: Double?
     /// Number of faces/edges in the stage when known.
     let count: Int
 
+    /// Waiting for another import to finish (the app loads one model at a time).
+    static let queued = CADLoadProgress(stage: .queued, fraction: nil, count: 0)
+
     var title: String {
         switch stage {
+        case .queued: "Waiting for another model to finish loading"
+        case .openingCache: "Opening cached model"
         case .reading: "Reading file"
         case .translating: "Translating B-Rep"
         case .meshing: count > 0 ? "Tessellating \(count.formatted()) faces" : "Tessellating faces"
@@ -42,22 +47,58 @@ private final class CADProgressRelay: @unchecked Sendable {
     init(_ handler: @escaping @Sendable (CADLoadProgress) -> Void) { self.handler = handler }
 }
 
+/// Stops an import in progress and caps the memory it may use. Wraps a
+/// reference-counted bridge token that is independent of the model, so it can
+/// be cancelled from any thread while (or after) the model is destroyed.
+final class CADLoadCancellation: @unchecked Sendable {
+    fileprivate let token: OpaquePointer?
+
+    init(memoryBudgetBytes: UInt64) {
+        token = CADBridgeCancelTokenCreate(memoryBudgetBytes)
+    }
+
+    convenience init(quality: CADMeshQuality) {
+        self.init(memoryBudgetBytes: quality.memoryBudgetBytes)
+    }
+
+    deinit {
+        if let token { CADBridgeCancelTokenRelease(token) }
+    }
+
+    /// Thread-safe; the load stops at its next check and throws CancellationError.
+    func cancel() {
+        if let token { CADBridgeCancelTokenCancel(token) }
+    }
+}
+
 /// Tessellation density. Thumbnails are tiny, so they trade detail for load
 /// time; the viewer and Quick Look preview use the full-quality mesh.
 enum CADMeshQuality {
     case thumbnail
     case full
 
-    fileprivate var options: CADMeshOptions {
+    var options: CADMeshOptions {
         var options = CADBridgeDefaultMeshOptions()
         options.parallel = 1
         if case .thumbnail = self {
-            options.healShapes = 0
             options.angularDeflectionRadians = 0.4
             options.linearDeflection = 0 // automatic, but see edgeDeflection
             options.linearDeflectionScale = 3
         }
         return options
+    }
+
+    /// Process footprint above which an import stops with a "too complex"
+    /// error instead of driving the Mac into swap: half of physical memory
+    /// (at least 4 GB) for the viewer and preview, a quarter (at least
+    /// 2.5 GB) for thumbnails, which Finder requests in bulk.
+    var memoryBudgetBytes: UInt64 {
+        let physical = ProcessInfo.processInfo.physicalMemory
+        let gigabyte: UInt64 = 1 << 30
+        switch self {
+        case .full: return max(4 * gigabyte, physical / 2)
+        case .thumbnail: return max(5 * gigabyte / 2, physical / 4)
+        }
     }
 }
 
@@ -83,7 +124,11 @@ final class CADModelAsset: @unchecked Sendable {
         let triangleIndices: [UInt32]
     }
 
-    private(set) lazy var surfaceGroups: [SurfaceGroup] = {
+    private(set) lazy var surfaceGroups: [SurfaceGroup] = Self.makeSurfaceGroups(triangles: triangles, faceRanges: faceRanges)
+
+    /// Groups appear in order of first occurrence by triangle index; at most
+    /// 48 colours (the most-used), the rest fall back to the default.
+    static func makeSurfaceGroups(triangles: [CADTriangle], faceRanges: [CADFaceRange]) -> [SurfaceGroup] {
         let colored = faceRanges.contains { $0.hasColor != 0 }
         guard colored, !triangles.isEmpty else {
             return [SurfaceGroup(color: nil, triangleIndices: Array(0..<UInt32(triangles.count)))]
@@ -97,8 +142,6 @@ final class CADModelAsset: @unchecked Sendable {
             return r << 16 | g << 8 | b
         }
         let maximumColors = 48
-        var order: [UInt32?] = []
-        var buckets: [UInt32?: [UInt32]] = [:]
         var faceKeys: [UInt32?] = faceRanges.map(key)
         var distinct = Set(faceKeys.compactMap { $0 })
         if distinct.count > maximumColors {
@@ -107,9 +150,20 @@ final class CADModelAsset: @unchecked Sendable {
             for (index, range) in faceRanges.enumerated() {
                 if let k = faceKeys[index] { counts[k, default: 0] += Int(range.triangleCount) }
             }
-            distinct = Set(counts.sorted { $0.value > $1.value }.prefix(maximumColors).map(\.key))
+            // Ties broken by colour so the choice is deterministic.
+            let ranked = counts.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+            distinct = Set(ranked.prefix(maximumColors).map(\.key))
             faceKeys = faceKeys.map { $0.flatMap { distinct.contains($0) ? $0 : nil } }
         }
+        func color(_ k: UInt32?) -> SIMD3<Float>? {
+            k.map { SIMD3<Float>(Float($0 >> 16 & 0xFF), Float($0 >> 8 & 0xFF), Float($0 & 0xFF)) / 255 }
+        }
+        if let groups = contiguousSurfaceGroups(triangles: triangles, faceRanges: faceRanges, faceKeys: faceKeys) {
+            return groups.map { SurfaceGroup(color: color($0.key), triangleIndices: $0.indices) }
+        }
+        // General case (faces not tiling the triangle array in order).
+        var order: [UInt32?] = []
+        var buckets: [UInt32?: [UInt32]] = [:]
         for (index, triangle) in triangles.enumerated() {
             let face = Int(triangle.faceIndex)
             let k: UInt32? = faceRanges.indices.contains(face) ? faceKeys[face] : nil
@@ -119,11 +173,61 @@ final class CADModelAsset: @unchecked Sendable {
             }
             buckets[k]!.append(UInt32(index))
         }
-        return order.map { k in
-            let color = k.map { SIMD3<Float>(Float($0 >> 16 & 0xFF), Float($0 >> 8 & 0xFF), Float($0 & 0xFF)) / 255 }
-            return SurfaceGroup(color: color, triangleIndices: buckets[k] ?? [])
+        return order.map { SurfaceGroup(color: color($0), triangleIndices: buckets[$0] ?? []) }
+    }
+
+    /// The bridge emits each face's triangles contiguously, faces in order.
+    /// When the face ranges tile the triangle array that way (checked,
+    /// including every triangle's faceIndex), each group's index list is
+    /// built from whole face ranges in one pass, with no per-triangle
+    /// dictionary lookup. Returns nil when the layout doesn't hold.
+    private static func contiguousSurfaceGroups(
+        triangles: [CADTriangle], faceRanges: [CADFaceRange], faceKeys: [UInt32?]
+    ) -> [(key: UInt32?, indices: [UInt32])]? {
+        var groupOfKey: [UInt32?: Int] = [:]
+        var keys: [UInt32?] = []
+        var sizes: [Int] = []
+        var faceGroups = [Int](repeating: -1, count: faceRanges.count)
+        var next = 0
+        for (face, range) in faceRanges.enumerated() where range.triangleCount > 0 {
+            guard Int(range.firstTriangle) == next else { return nil }
+            next += Int(range.triangleCount)
+            guard next <= triangles.count else { return nil }
+            let k = faceKeys[face]
+            let group: Int
+            if let existing = groupOfKey[k] {
+                group = existing
+            } else {
+                group = keys.count
+                groupOfKey[k] = group
+                keys.append(k)
+                sizes.append(0)
+            }
+            sizes[group] += Int(range.triangleCount)
+            faceGroups[face] = group
         }
-    }()
+        guard next == triangles.count else { return nil }
+        let consistent = triangles.withUnsafeBufferPointer { buffer in
+            for (face, range) in faceRanges.enumerated() where range.triangleCount > 0 {
+                let first = Int(range.firstTriangle)
+                let faceIndex = UInt32(face)
+                for index in first..<first + Int(range.triangleCount) where buffer[index].faceIndex != faceIndex {
+                    return false
+                }
+            }
+            return true
+        }
+        guard consistent else { return nil }
+        var lists = sizes.map { size -> [UInt32] in
+            var list: [UInt32] = []
+            list.reserveCapacity(size)
+            return list
+        }
+        for (face, range) in faceRanges.enumerated() where range.triangleCount > 0 {
+            lists[faceGroups[face]].append(contentsOf: range.firstTriangle..<range.firstTriangle + range.triangleCount)
+        }
+        return zip(keys, lists).map { (key: $0, indices: $1) }
+    }
 
     /// Global triangle index for a hit on surface element `element`, primitive `primitive`.
     func triangleIndex(element: Int, primitive: Int) -> Int? {
@@ -194,17 +298,25 @@ final class CADModelAsset: @unchecked Sendable {
 
     /// Open CASCADE model, or nil for drawings parsed in Swift.
     private let handle: OpaquePointer?
+    /// Serialises every bridge call on `handle` after init: the display-data
+    /// release dispatched at the end of a load, then measurements and
+    /// destruction, which wait for it (briefly, only right after a load).
+    private let bridgeQueue = DispatchQueue(label: "com.liamflanagan.CADQuickLook.model-bridge")
 
     init(
         url: URL,
         quality: CADMeshQuality = .full,
+        cancellation: CADLoadCancellation? = nil,
         progress: (@Sendable (CADLoadProgress) -> Void)? = nil
     ) throws {
+        try Task.checkCancellation()
         self.url = url
 
         if url.pathExtension.lowercased() == "dxf" {
             progress?(CADLoadProgress(stage: .reading, fraction: nil, count: 0))
             let drawing = try DXFDrawing(url: url)
+            // DXF parsing can't be interrupted; at least drop the result early.
+            try Task.checkCancellation()
             let scale = drawing.unitScaleToMillimeters
             var points: [CADPoint3D] = []
             var edges: [CADEdgePolyline] = []
@@ -270,11 +382,75 @@ final class CADModelAsset: @unchecked Sendable {
             return
         }
 
+        // Model cache: B-Rep formats of at least 2 MB, keyed for the
+        // full-quality mesh (thumbnails may read a full entry, never write).
+        let cache = CADModelCache.shared
+        let cacheOptions = CADMeshQuality.full.options
+        let cacheKey = cache?.lookupKey(for: url, options: cacheOptions)
+        // Always load (and restore) with a token so the memory budget applies
+        // even to callers that never cancel (thumbnails).
+        let cancellation = cancellation ?? CADLoadCancellation(quality: quality)
+
+        // The entry's section hashes (shape bytes included) were verified by
+        // read(); a damaged shape can otherwise restore "OK" with wrong geometry.
+        if let cache, let cacheKey, let entry = cache.read(key: cacheKey) {
+            try Task.checkCancellation()
+            progress?(CADLoadProgress(stage: .openingCache, fraction: nil, count: 0))
+            guard let model = CADBridgeModelCreate() else {
+                throw CADModelError.createFailed
+            }
+            CADBridgeModelSetCancelToken(model, cancellation.token)
+            let status = Self.restore(model, from: entry)
+            CADBridgeModelSetCancelToken(model, nil)
+            withExtendedLifetime(cancellation) {}
+            switch status {
+            case CADBridgeStatusOK:
+                break
+            case CADBridgeStatusCancelled:
+                CADBridgeModelDestroy(model)
+                throw CancellationError()
+            case CADBridgeStatusResourceLimit:
+                // Over budget: a full load would be too, so fail like one would.
+                // The entry itself is fine; keep it.
+                let detail = CADBridgeModelLastError(model).map { String(cString: $0) }
+                CADBridgeModelDestroy(model)
+                throw CADModelError.loadFailed(detail ?? "This model is too complex to display.")
+            case CADBridgeStatusImportFailed:
+                // Unparseable or inconsistent with its tables: drop the entry.
+                CADBridgeModelDestroy(model)
+                cache.remove(key: cacheKey)
+            default:
+                CADBridgeModelDestroy(model)
+            }
+            if status == CADBridgeStatusOK {
+                if Task.isCancelled {
+                    CADBridgeModelDestroy(model)
+                    throw CancellationError()
+                }
+                handle = model
+                isPlanar = false
+                vertices = entry.vertices
+                triangles = entry.triangles
+                faceRanges = entry.faceRanges
+                polylinePoints = entry.polylinePoints
+                edges = entry.edges
+                bounds = entry.bounds
+                stats = entry.stats
+                edgeColors = []
+                drawingTexts = []
+                progress?(CADLoadProgress(stage: .finishing, fraction: nil, count: 0))
+                return
+            }
+            // ImportFailed or an unexpected status: load the file normally.
+        }
+
         guard let model = CADBridgeModelCreate() else {
             throw CADModelError.createFailed
         }
         handle = model
         isPlanar = false
+
+        CADBridgeModelSetCancelToken(model, cancellation.token)
 
         var relay: Unmanaged<CADProgressRelay>?
         if let progress {
@@ -294,21 +470,43 @@ final class CADModelAsset: @unchecked Sendable {
                 relay.handler(CADLoadProgress(stage: mapped, fraction: fraction >= 0 ? fraction : nil, count: Int(count)))
             }, box.toOpaque())
         }
-        defer {
-            CADBridgeModelSetProgressCallback(model, nil, nil)
-            relay?.release()
-        }
 
         let options = quality.options
+        let loadStarted = ContinuousClock.now
         let status = url.path.withCString { path in
             CADBridgeModelLoad(model, path, options)
         }
+        let loadDuration = ContinuousClock.now - loadStarted
+        let loadSeconds = Double(loadDuration.components.seconds) + Double(loadDuration.components.attoseconds) / 1e18
+
+        // Detach the callback and token before anything below can destroy the
+        // model (a throwing init never runs deinit, so the failure path
+        // destroys it here; a `defer` would touch the freed model).
+        CADBridgeModelSetProgressCallback(model, nil, nil)
+        CADBridgeModelSetCancelToken(model, nil)
+        relay?.release()
+        withExtendedLifetime(cancellation) {}
 
         guard status == CADBridgeStatusOK else {
             let detail = CADBridgeModelLastError(model).map { String(cString: $0) }
-                ?? "The CAD file could not be imported."
             CADBridgeModelDestroy(model)
-            throw CADModelError.loadFailed(detail)
+            switch status {
+            case CADBridgeStatusCancelled:
+                throw CancellationError()
+            case CADBridgeStatusResourceLimit:
+                throw CADModelError.loadFailed(detail ?? "This model is too complex to display.")
+            default:
+                throw CADModelError.loadFailed(detail ?? "The CAD file could not be imported.")
+            }
+        }
+
+        // A slow full-quality load qualifies for the cache: take the B-Rep
+        // bytes now (cheap next to the load); compression and the write run
+        // in the background once the asset exists. NULL (no shape) means no
+        // entry. The bytes vary between copies, so they are never a key.
+        var shapeData: Data?
+        if quality == .full, cacheKey != nil, loadSeconds > CADModelCache.minimumLoadSeconds {
+            shapeData = Self.copyShapeData(model)
         }
 
         vertices = Self.copy(CADBridgeModelVertices(model), count: CADBridgeModelVertexCount(model))
@@ -322,28 +520,97 @@ final class CADModelAsset: @unchecked Sendable {
         drawingTexts = []
         // The arrays above are the only copies the viewer uses; the bridge's
         // originals and Open CASCADE's per-face tessellation would otherwise
-        // sit in memory for as long as the model is open.
-        CADBridgeModelReleaseDisplayData(model)
+        // sit in memory for as long as the model is open. Freeing them takes
+        // tens of milliseconds on a large assembly, so it runs on the bridge
+        // queue instead of delaying the load; later bridge calls queue behind it.
+        let releaseTarget = CADBridgeHandle(pointer: model)
+        bridgeQueue.async {
+            CADBridgeModelReleaseDisplayData(releaseTarget.pointer)
+        }
+
+        if let cache, let cacheKey, let shapeData {
+            let entry = CADModelCache.Entry(
+                vertices: vertices, triangles: triangles, faceRanges: faceRanges,
+                polylinePoints: polylinePoints, edges: edges, bounds: bounds, stats: stats,
+                shapeData: shapeData, loadSeconds: loadSeconds
+            )
+            cache.storeInBackground(entry, key: cacheKey, source: url, options: cacheOptions)
+        }
     }
 
     deinit {
-        if let handle { CADBridgeModelDestroy(handle) }
+        if let handle {
+            bridgeQueue.sync { CADBridgeModelDestroy(handle) }
+        }
+    }
+
+    /// Rebuilds the bridge model from a cache entry's B-Rep and tables.
+    private static func restore(_ model: OpaquePointer, from entry: CADModelCache.Entry) -> CADBridgeStatus {
+        entry.shapeData.withUnsafeBytes { shape in
+            entry.faceRanges.withUnsafeBufferPointer { faces in
+                entry.edges.withUnsafeBufferPointer { edges in
+                    guard let base = shape.baseAddress, !shape.isEmpty else { return CADBridgeStatusImportFailed }
+                    return CADBridgeModelRestore(
+                        model, base.assumingMemoryBound(to: UInt8.self), shape.count,
+                        faces.baseAddress, faces.count, edges.baseAddress, edges.count,
+                        entry.bounds, entry.stats
+                    )
+                }
+            }
+        }
+    }
+
+    /// The model's exact B-Rep in the bridge's binary format, or nil.
+    private static func copyShapeData(_ model: OpaquePointer) -> Data? {
+        var length = 0
+        guard let bytes = CADBridgeModelCopyShapeData(model, &length) else { return nil }
+        guard length > 0 else {
+            CADBridgeFree(bytes)
+            return nil
+        }
+        return Data(bytesNoCopy: bytes, count: length, deallocator: .custom { pointer, _ in CADBridgeFree(pointer) })
+    }
+
+    /// Imports off the calling actor. Cancelling the calling task stops the
+    /// import through its cancel token (Open CASCADE formats; DXF is parsed
+    /// in Swift and only stops between stages) and throws CancellationError.
+    static func load(
+        url: URL,
+        quality: CADMeshQuality = .full,
+        progress: (@Sendable (CADLoadProgress) -> Void)? = nil
+    ) async throws -> CADModelAsset {
+        let cancellation = CADLoadCancellation(quality: quality)
+        let task = Task.detached(priority: .userInitiated) {
+            try CADModelAsset(url: url, quality: quality, cancellation: cancellation, progress: progress)
+        }
+        return try await withTaskCancellationHandler {
+            let asset = try await task.value
+            try Task.checkCancellation()
+            return asset
+        } onCancel: {
+            cancellation.cancel()
+            task.cancel()
+        }
     }
 
     /// Exact B-Rep face area, computed by Open CASCADE on first request.
     func faceArea(_ index: Int) -> Double {
         guard let handle else { return faceRanges.indices.contains(index) ? max(faceRanges[index].exactArea, 0) : 0 }
-        var area = 0.0
-        _ = CADBridgeModelFaceArea(handle, UInt32(index), &area)
-        return area
+        return bridgeQueue.sync {
+            var area = 0.0
+            _ = CADBridgeModelFaceArea(handle, UInt32(index), &area)
+            return area
+        }
     }
 
     /// Exact B-Rep edge length, computed by Open CASCADE on first request.
     func edgeLength(_ index: Int) -> Double {
         guard let handle else { return edges.indices.contains(index) ? max(edges[index].exactLength, 0) : 0 }
-        var length = 0.0
-        _ = CADBridgeModelEdgeLength(handle, UInt32(index), &length)
-        return length
+        return bridgeQueue.sync {
+            var length = 0.0
+            _ = CADBridgeModelEdgeLength(handle, UInt32(index), &length)
+            return length
+        }
     }
 
     /// Exact minimum distance between two entities (points, edges, faces in
@@ -357,12 +624,14 @@ final class CADModelAsset: @unchecked Sendable {
             let delta = b.point.simdDouble - a.point.simdDouble
             return CADFaceDistance(distance: simd_length(delta), pointOnFaceA: a.point, pointOnFaceB: b.point)
         }
-        var result = CADFaceDistance()
-        let status = CADBridgeModelMeasureDistance(handle, a, b, &result)
+        let (status, result, detail) = bridgeQueue.sync {
+            var result = CADFaceDistance()
+            let status = CADBridgeModelMeasureDistance(handle, a, b, &result)
+            let detail = status == CADBridgeStatusOK ? nil : CADBridgeModelLastError(handle).map { String(cString: $0) }
+            return (status, result, detail)
+        }
         guard status == CADBridgeStatusOK else {
-            let detail = CADBridgeModelLastError(handle).map { String(cString: $0) }
-                ?? "The distance between those entities could not be measured."
-            throw CADModelError.loadFailed(detail)
+            throw CADModelError.loadFailed(detail ?? "The distance between those entities could not be measured.")
         }
         return result
     }
@@ -371,6 +640,12 @@ final class CADModelAsset: @unchecked Sendable {
         guard let pointer, count > 0 else { return [] }
         return Array(UnsafeBufferPointer(start: pointer, count: count))
     }
+}
+
+/// A bridge model pointer handed to the asset's bridge queue. Only used for
+/// calls that the queue serialises.
+private struct CADBridgeHandle: @unchecked Sendable {
+    let pointer: OpaquePointer
 }
 
 extension CADPoint3D {

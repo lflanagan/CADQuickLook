@@ -11,6 +11,9 @@ final class CADDocumentStore {
     var errorMessage: String?
     /// Incremented per open() so a slow earlier load cannot overwrite a newer one.
     private var loadGeneration = 0
+    /// The load in flight; cancelled by close() and by a newer open(), which
+    /// stops the import (or removes it from the import queue).
+    private var loadTask: Task<Void, Never>?
 
     var representedURL: URL? { asset?.url }
 
@@ -19,6 +22,8 @@ final class CADDocumentStore {
     /// with it hundreds of megabytes of mesh and B-Rep.
     func close() {
         loadGeneration += 1
+        loadTask?.cancel()
+        loadTask = nil
         asset = nil
         isLoading = false
         loadingURL = nil
@@ -36,21 +41,31 @@ final class CADDocumentStore {
         loadingURL = url
         loadingProgress = nil
         loadGeneration += 1
+        loadTask?.cancel()
         let generation = loadGeneration
-        Task {
+        loadTask = Task {
             do {
-                // Tessellation runs off the main thread so the window stays responsive.
-                let loaded = try await Task.detached(priority: .userInitiated) {
-                    try CADModelAsset(url: url) { progress in
-                        Task { @MainActor [weak self] in
-                            guard let self, self.loadGeneration == generation else { return }
+                // One import at a time across the app; tessellation runs off
+                // the main thread so the window stays responsive.
+                let loaded = try await CADImportGate.run(whileWaiting: {
+                    Task { @MainActor in
+                        guard self.loadGeneration == generation else { return }
+                        self.loadingProgress = .queued
+                    }
+                }) {
+                    try await CADModelAsset.load(url: url) { progress in
+                        Task { @MainActor in
+                            guard self.loadGeneration == generation else { return }
                             self.loadingProgress = progress
                         }
                     }
-                }.value
+                }
                 guard loadGeneration == generation else { return }
                 asset = loaded
                 errorMessage = nil
+            } catch is CancellationError {
+                // Closed or superseded; nothing to report.
+                guard loadGeneration == generation else { return }
             } catch {
                 guard loadGeneration == generation else { return }
                 errorMessage = error.localizedDescription
@@ -58,6 +73,7 @@ final class CADDocumentStore {
             isLoading = false
             loadingURL = nil
             loadingProgress = nil
+            loadTask = nil
         }
     }
 }

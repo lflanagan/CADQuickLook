@@ -168,13 +168,29 @@ enum CADSceneFactory {
         return geometry
     }
 
-    /// Nudges every vertex a fraction of its depth toward the camera so
-    /// coplanar overlays (edge lines, face highlights) win the depth test.
+    /// Vertical field of view of the scene camera, in degrees.
+    static let cameraFieldOfView: Double = 38
+
+    /// Nudges every vertex toward the camera so coplanar overlays (edge
+    /// lines, face highlights) win the depth test. The nudge is `amount`
+    /// of the vertex's depth, which keeps it a constant size on screen in
+    /// perspective. In orthographic mode the camera stays far away and
+    /// zooming only changes the view height, so a depth-based nudge stays
+    /// millimetres thick at any zoom and lets edges behind thin plates
+    /// show through. There the nudge scales with the view's half-height
+    /// (1 / P[1][1]) instead, at the size it would have in the matching
+    /// perspective view (the same half-height at the camera's 38 degrees).
     static func depthBiasModifier(_ amount: Float) -> String {
-        """
+        let halfFieldOfView = cameraFieldOfView * .pi / 360
+        let orthographicAmount = amount / Float(tan(halfFieldOfView))
+        return """
         #pragma body
         float4 viewPosition = scn_node.modelViewTransform * _geometry.position;
-        viewPosition.z += \(amount) * abs(viewPosition.z);
+        float4x4 projection = scn_frame.projectionTransform;
+        float bias = (projection[3][3] > 0.5)
+            ? \(orthographicAmount) / projection[1][1]
+            : \(amount) * abs(viewPosition.z);
+        viewPosition.z += bias;
         _geometry.position = scn_node.inverseModelViewTransform * viewPosition;
         """
     }
@@ -191,7 +207,7 @@ enum CADSceneFactory {
         var order: [SIMD3<Float>?] = []
         var groups: [SIMD3<Float>?: [UInt32]] = [:]
         let maximumColors = 64
-        for (edgeIndex, edge) in asset.edges.enumerated() where (edge.isTangent != 0) == tangent {
+        for (edgeIndex, edge) in asset.edges.enumerated() where edge.isHidden == 0 && (edge.isTangent != 0) == tangent {
             let first = Int(edge.firstPoint)
             let count = Int(edge.pointCount)
             guard count > 1, first + count <= points.count else { continue }
@@ -344,30 +360,286 @@ enum CADSceneFactory {
         scene.rootNode.addChildNode(ambient)
     }
 
+    /// Centre of the model for orbiting: the framing box's centre, so stray
+    /// geometry doesn't pull it off the model.
     static func orbitPivot(for asset: CADModelAsset) -> SCNVector3 {
-        // Drawings and multi-body assemblies frame on their bounding box;
-        // single parts frame on their origin so the datum stays centred.
-        guard asset.isPlanar || asset.stats.solidCount > 1 || asset.stats.shellCount > 1 else { return SCNVector3Zero }
-        let minimum = asset.bounds.minimum.sceneVector
-        let maximum = asset.bounds.maximum.sceneVector
-        return SCNVector3(
-            (minimum.x + maximum.x) * 0.5,
-            (minimum.y + maximum.y) * 0.5,
-            (minimum.z + maximum.z) * 0.5
-        )
+        let box = framingBox(for: asset)
+        let center = (box.minimum + box.maximum) * 0.5
+        return SCNVector3(center.x, center.y, center.z)
     }
 
+    /// Radius of the framing box's sphere around `pivot`: the model's size,
+    /// for scale-dependent sizes such as the axis probe.
     static func fittingRadius(for asset: CADModelAsset, around pivot: SCNVector3) -> CGFloat {
-        let minimum = asset.bounds.minimum.sceneVector
-        let maximum = asset.bounds.maximum.sceneVector
+        let box = framingBox(for: asset)
+        let minimum = SCNVector3(box.minimum.x, box.minimum.y, box.minimum.z)
+        let maximum = SCNVector3(box.maximum.x, box.maximum.y, box.maximum.z)
         let xExtent = max(abs(minimum.x - pivot.x), abs(maximum.x - pivot.x))
         let yExtent = max(abs(minimum.y - pivot.y), abs(maximum.y - pivot.y))
         let zExtent = max(abs(minimum.z - pivot.z), abs(maximum.z - pivot.z))
         return max(sqrt(xExtent * xExtent + yExtent * yExtent + zExtent * zExtent), 1)
     }
 
-    /// Distance from the fitting sphere's centre to the camera, in radii.
-    static let fittingDistanceFactor: Float = 3.4
+    /// Axis-aligned box the camera frames, in scene units.
+    struct FramingBox: Equatable, Sendable {
+        var minimum: SIMD3<Float>
+        var maximum: SIMD3<Float>
+    }
+
+    /// The box the camera frames: the model's bounding box with tiny stray
+    /// geometry far from the rest left out (a forgotten 1 mm body, a sliver
+    /// face), so it doesn't shrink the model in the view. Weighted by surface
+    /// area: on each axis, clusters at the ends holding at most 0.5% of the
+    /// area and separated from the rest by an empty gap are left out, then
+    /// every face holding a meaningful share of the area is added back
+    /// whole, so real parts at the edge of an assembly stay in. Drawings and models
+    /// without a mesh use their bounding box. Computed once per asset.
+    static func framingBox(for asset: CADModelAsset) -> FramingBox {
+        if let cached = framingCache.box(for: asset) { return cached }
+        let box = computeFramingBox(for: asset)
+        framingCache.store(box, for: asset)
+        return box
+    }
+
+    private static let framingCache = FramingBoxCache()
+
+    private final class FramingBoxCache: @unchecked Sendable {
+        final class Entry {
+            let box: FramingBox
+            init(_ box: FramingBox) { self.box = box }
+        }
+
+        private let lock = NSLock()
+        private let table = NSMapTable<CADModelAsset, Entry>(
+            keyOptions: [.weakMemory, .objectPointerPersonality],
+            valueOptions: .strongMemory
+        )
+
+        func box(for asset: CADModelAsset) -> FramingBox? {
+            lock.withLock { table.object(forKey: asset)?.box }
+        }
+
+        func store(_ box: FramingBox, for asset: CADModelAsset) {
+            lock.withLock { table.setObject(Entry(box), forKey: asset) }
+        }
+    }
+
+    private static func computeFramingBox(for asset: CADModelAsset) -> FramingBox {
+        let bounds = FramingBox(
+            minimum: SIMD3<Float>(Float(asset.bounds.minimum.x), Float(asset.bounds.minimum.y), Float(asset.bounds.minimum.z)),
+            maximum: SIMD3<Float>(Float(asset.bounds.maximum.x), Float(asset.bounds.maximum.y), Float(asset.bounds.maximum.z))
+        )
+        guard !asset.isPlanar, !asset.vertices.isEmpty, !asset.triangles.isEmpty else { return bounds }
+        let extent = bounds.maximum - bounds.minimum
+        guard extent.x.isFinite, extent.y.isFinite, extent.z.isFinite, simd_reduce_max(extent) > 0 else { return bounds }
+
+        // Area-weighted histogram of triangle centroids on each axis, and
+        // the area of each face.
+        let binCount = 1024
+        let binScale = SIMD3<Float>(repeating: Float(binCount)) / simd_max(extent, SIMD3<Float>(repeating: .leastNormalMagnitude))
+        var histogram = [Double](repeating: 0, count: binCount * 3)
+        var faceAreas = [Double](repeating: 0, count: asset.faceRanges.count)
+        var totalArea = 0.0
+        asset.vertices.withUnsafeBufferPointer { vertices in
+            asset.triangles.withUnsafeBufferPointer { triangles in
+                histogram.withUnsafeMutableBufferPointer { histogram in
+                    faceAreas.withUnsafeMutableBufferPointer { faceAreas in
+                        let vertexCount = vertices.count
+                        let lastBin = SIMD3<Float>(repeating: Float(binCount - 1))
+                        for triangle in triangles {
+                            let i0 = Int(triangle.i0), i1 = Int(triangle.i1), i2 = Int(triangle.i2)
+                            guard i0 < vertexCount, i1 < vertexCount, i2 < vertexCount else { continue }
+                            let a = SIMD3<Float>(vertices[i0].x, vertices[i0].y, vertices[i0].z)
+                            let b = SIMD3<Float>(vertices[i1].x, vertices[i1].y, vertices[i1].z)
+                            let c = SIMD3<Float>(vertices[i2].x, vertices[i2].y, vertices[i2].z)
+                            let area = Double(simd_length(simd_cross(b - a, c - a)) * 0.5)
+                            guard area > 0, area.isFinite else { continue }
+                            totalArea += area
+                            let face = Int(triangle.faceIndex)
+                            if face < faceAreas.count { faceAreas[face] += area }
+                            let bin = simd_clamp(((a + b + c) / 3 - bounds.minimum) * binScale, .zero, lastBin)
+                            histogram[Int(bin.x)] += area
+                            histogram[binCount + Int(bin.y)] += area
+                            histogram[2 * binCount + Int(bin.z)] += area
+                        }
+                    }
+                }
+            }
+        }
+        guard totalArea > 0, totalArea.isFinite else { return bounds }
+
+        // On each axis, drop end clusters holding at most 0.5% of the area
+        // that sit beyond an empty gap of at least 5% of the extent: stray
+        // bodies away from the model, never the ends of connected geometry.
+        let tail = totalArea * 0.005
+        let gapBins = binCount / 20
+        var box = bounds
+        let binSize = extent / Float(binCount)
+        for axis in 0..<3 {
+            let bins = histogram[(axis * binCount)..<((axis + 1) * binCount)].map { $0 }
+            var low = 0
+            var high = binCount - 1
+            var trimmed = 0.0
+            // Trims one cluster from the low (step 1) or high (step -1) end.
+            func trimCluster(from start: Int, step: Int) -> Int? {
+                var index = start
+                var sum = 0.0
+                while index >= low, index <= high, bins[index] > 0 {
+                    sum += bins[index]
+                    index += step
+                }
+                guard trimmed + sum <= tail else { return nil }
+                var gap = 0
+                while index >= low, index <= high, bins[index] == 0 {
+                    gap += 1
+                    index += step
+                }
+                guard gap >= gapBins, index >= low, index <= high else { return nil }
+                trimmed += sum
+                return index
+            }
+            while bins[low] == 0, low < high { low += 1 }
+            while bins[high] == 0, high > low { high -= 1 }
+            // Sides with nothing to drop keep their true bound.
+            var trimmedLow = false
+            var trimmedHigh = false
+            while let next = trimCluster(from: low, step: 1) { low = next; trimmedLow = true }
+            while let next = trimCluster(from: high, step: -1) { high = next; trimmedHigh = true }
+            if trimmedLow { box.minimum[axis] = bounds.minimum[axis] + Float(low) * binSize[axis] }
+            if trimmedHigh { box.maximum[axis] = bounds.minimum[axis] + Float(high + 1) * binSize[axis] }
+        }
+
+        // Add back every face with a meaningful share of the area, whole.
+        let significantArea = totalArea * 0.002
+        asset.vertices.withUnsafeBufferPointer { vertices in
+            asset.triangles.withUnsafeBufferPointer { triangles in
+                for (face, range) in asset.faceRanges.enumerated() where faceAreas[face] >= significantArea {
+                    let first = Int(range.firstTriangle)
+                    let end = min(first + Int(range.triangleCount), triangles.count)
+                    guard first < end else { continue }
+                    func include(_ index: UInt32) {
+                        guard Int(index) < vertices.count else { return }
+                        let vertex = vertices[Int(index)]
+                        let point = SIMD3<Float>(vertex.x, vertex.y, vertex.z)
+                        box.minimum = simd_min(box.minimum, point)
+                        box.maximum = simd_max(box.maximum, point)
+                    }
+                    for triangle in triangles[first..<end] {
+                        include(triangle.i0)
+                        include(triangle.i1)
+                        include(triangle.i2)
+                    }
+                }
+            }
+        }
+
+        // Pad a little, never past the true bounds.
+        let padding = (box.maximum - box.minimum) * 0.02
+        box.minimum = simd_max(box.minimum - padding, bounds.minimum)
+        box.maximum = simd_min(box.maximum + padding, bounds.maximum)
+        guard simd_reduce_min(box.maximum - box.minimum) >= 0 else { return bounds }
+        return box
+    }
+
+    /// Where a camera with a given orientation looks from to fit the model.
+    struct CameraFit: Sendable {
+        /// The look-at point: the centre of the framed view, at the depth
+        /// of the framing box's centre.
+        var target: SIMD3<Float>
+        /// Distance from `target` back to the camera along its view axis.
+        var distance: Float
+        /// Half the view height, for an orthographic camera.
+        var orthographicScale: Double
+    }
+
+    /// Room left around the fitted model: its projected half-extent times
+    /// this fills half the view.
+    static let fittingMargin: Float = 1.08
+
+    /// Fits the model in a view with the camera's `orientation`, the scene
+    /// camera's vertical field of view and the viewport's `aspect` (width
+    /// over height). Projects every mesh vertex inside the framing box (or
+    /// the box's corners for drawings and models without a mesh) onto the
+    /// camera's axes, so the model fills the view with `fittingMargin` to
+    /// spare and sits in its middle. Perspective cameras get the tightest
+    /// frustum containing those points; orthographic ones the tightest
+    /// view height. Clipping is unaffected: the camera adjusts its z range
+    /// to the whole scene.
+    static func cameraFit(
+        for asset: CADModelAsset,
+        orientation: simd_quatf,
+        aspect: Float = 1,
+        orthographic: Bool
+    ) -> CameraFit {
+        let box = framingBox(for: asset)
+        let right = orientation.act(SIMD3<Float>(1, 0, 0))
+        let up = orientation.act(SIMD3<Float>(0, 1, 0))
+        let backward = orientation.act(SIMD3<Float>(0, 0, 1))
+        let tanY = Float(tan(cameraFieldOfView * .pi / 360)) / fittingMargin
+        let tanX = tanY * (aspect.isFinite && aspect > 0 ? aspect : 1)
+
+        // Extents on the camera axes (x right, y up, z towards the camera),
+        // and for perspective the frustum bounds: a point fits the half
+        // angle on x when x + tanX*z <= cx + tanX*Zc and x - tanX*z >= cx -
+        // tanX*Zc, Zc being the camera's depth.
+        var low = SIMD3<Float>(repeating: .infinity)
+        var high = SIMD3<Float>(repeating: -.infinity)
+        var frustumHigh = SIMD2<Float>(repeating: -.infinity)
+        var frustumLow = SIMD2<Float>(repeating: .infinity)
+        let tangents = SIMD2<Float>(tanX, tanY)
+        func include(_ point: SIMD3<Float>) {
+            let projected = SIMD3<Float>(simd_dot(point, right), simd_dot(point, up), simd_dot(point, backward))
+            low = simd_min(low, projected)
+            high = simd_max(high, projected)
+            let lateral = SIMD2<Float>(projected.x, projected.y)
+            frustumHigh = simd_max(frustumHigh, lateral + tangents * projected.z)
+            frustumLow = simd_min(frustumLow, lateral - tangents * projected.z)
+        }
+        if !asset.isPlanar, !asset.vertices.isEmpty, !asset.triangles.isEmpty {
+            asset.vertices.withUnsafeBufferPointer { vertices in
+                for vertex in vertices {
+                    let point = SIMD3<Float>(vertex.x, vertex.y, vertex.z)
+                    guard all(point .>= box.minimum), all(point .<= box.maximum) else { continue }
+                    include(point)
+                }
+            }
+        }
+        if !(low.x <= high.x) {
+            for corner in 0..<8 {
+                include(SIMD3<Float>(
+                    corner & 1 == 0 ? box.minimum.x : box.maximum.x,
+                    corner & 2 == 0 ? box.minimum.y : box.maximum.y,
+                    corner & 4 == 0 ? box.minimum.z : box.maximum.z
+                ))
+            }
+        }
+        guard low.x.isFinite, high.x.isFinite else {
+            return CameraFit(target: .zero, distance: 10, orthographicScale: 1)
+        }
+
+        let size = max(simd_length(high - low), 1e-3)
+        let depthCenter = (low.z + high.z) * 0.5
+        // Keep the camera clear of the model's near side.
+        let minimumDistance = (high.z - depthCenter) + size * 0.25
+        let lateralCenter: SIMD2<Float>
+        let distance: Float
+        let orthographicScale: Float
+        if orthographic {
+            lateralCenter = (SIMD2<Float>(low.x, low.y) + SIMD2<Float>(high.x, high.y)) * 0.5
+            let halfExtent = (SIMD2<Float>(high.x, high.y) - SIMD2<Float>(low.x, low.y)) * 0.5
+            orthographicScale = max(max(halfExtent.y / tanY, halfExtent.x / tanX) * Float(tan(cameraFieldOfView * .pi / 360)), size * 1e-3)
+            // The camera stays as far back as a perspective camera showing
+            // the same height would, as zooming expects.
+            distance = max(orthographicScale / Float(tan(cameraFieldOfView * .pi / 360)), minimumDistance)
+        } else {
+            lateralCenter = (frustumHigh + frustumLow) * 0.5
+            let cameraDepth = (frustumHigh - frustumLow) * 0.5 / tangents
+            distance = max(max(cameraDepth.x, cameraDepth.y) - depthCenter, minimumDistance)
+            orthographicScale = distance * Float(tan(cameraFieldOfView * .pi / 360))
+        }
+        let target = right * lateralCenter.x + up * lateralCenter.y + backward * depthCenter
+        return CameraFit(target: target, distance: distance, orthographicScale: Double(orthographicScale))
+    }
 
     /// Default front-right-top view: camera at +X, -Y, +Z looking at the model.
     static let defaultCameraOffset = simd_normalize(SIMD3<Float>(1.25, -0.9, 1.45))
@@ -398,27 +670,26 @@ enum CADSceneFactory {
     }
 
     private static func addCamera(to scene: SCNScene, asset: CADModelAsset) {
-        let pivot = orbitPivot(for: asset)
-        let fittingRadius = Float(fittingRadius(for: asset, around: pivot))
+        let orientation = asset.isPlanar ? cameraOrientation(for: .top) : cameraOrientation(offset: defaultCameraOffset)
+        let orthographic = asset.isPlanar || CADPreferences.cameraProjection == .orthographic
+        // Thumbnails are square; a window refits to its own shape on demand.
+        let fit = cameraFit(for: asset, orientation: orientation, orthographic: orthographic)
 
         let target = SCNNode()
         target.name = "CameraTarget"
-        target.position = pivot
+        target.simdPosition = fit.target
         scene.rootNode.addChildNode(target)
 
         let camera = SCNNode()
         camera.name = "Camera"
         camera.camera = SCNCamera()
-        camera.camera?.fieldOfView = 38
+        camera.camera?.fieldOfView = cameraFieldOfView
         camera.camera?.automaticallyAdjustsZRange = true
-        let distance = fittingRadius * fittingDistanceFactor
-        let offset = asset.isPlanar ? SIMD3<Float>(0, 0, 1) : defaultCameraOffset
-        camera.simdPosition = target.simdPosition + offset * distance
-        camera.simdOrientation = asset.isPlanar ? cameraOrientation(for: .top) : cameraOrientation(offset: defaultCameraOffset)
-        if asset.isPlanar || CADPreferences.cameraProjection == .orthographic, let cameraGeometry = camera.camera {
-            let fieldOfViewRadians = Float(cameraGeometry.fieldOfView) * .pi / 180
+        camera.simdOrientation = orientation
+        camera.simdPosition = fit.target + orientation.act(SIMD3<Float>(0, 0, 1)) * fit.distance
+        if orthographic, let cameraGeometry = camera.camera {
             cameraGeometry.usesOrthographicProjection = true
-            cameraGeometry.orthographicScale = Double(distance * tan(fieldOfViewRadians * 0.5))
+            cameraGeometry.orthographicScale = fit.orthographicScale
         }
         scene.rootNode.addChildNode(camera)
     }

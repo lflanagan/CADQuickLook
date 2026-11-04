@@ -11,6 +11,7 @@ A native macOS viewer for STEP, IGES, BREP, STL, and DXF files, with Finder thum
 - STEP assembly placement and part colours through Open CASCADE
 - DXF drawings with layer colours, text, dimensions, and hatch boundaries
 - View menu shortcuts (⌘1–⌘7 standard views, ⌘0 fit, P projection, E edges), Open Recent, drag and drop, one window per file
+- Large STEP, IGES and BREP models open in about a second the second time: a model cache keeps the processed model, never stores file names, stays under a size you choose (2 GB by default) and drops entries unused for 30 days
 - STL files are viewed as meshes: no edges or measurements, but multi-million-triangle scans open in seconds
 - The same viewer and controls in the app and Quick Look
 
