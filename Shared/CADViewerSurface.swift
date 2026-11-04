@@ -19,7 +19,10 @@ final class CADViewerSurface: NSView {
     private let loadingBar = NSProgressIndicator()
     private let buildStampLabel = NSTextField(labelWithString: CADBuildInfo.stamp)
     /// File icon + name in the title strip, inline with the traffic lights.
-    private let fileIcon = NSImageView()
+    /// Zero-width anchor that positions the file name. The Finder icon used
+    /// to be drawn here, but for CAD files it is the cached Quick Look
+    /// thumbnail (often stale and tiny), so only the name is shown.
+    private let fileIcon = NSView()
     private let fileNameLabel = NSTextField(labelWithString: "")
     /// Left inset of the gear menu (then file name): past the traffic lights (app window) or
     /// flush with the panel edge (Quick Look has no traffic lights).
@@ -29,16 +32,20 @@ final class CADViewerSurface: NSView {
     /// panel's corner, inset the same from the top and the left so its
     /// circle reads as concentric with the rounded corner.
     private static let quickLookCornerInset: CGFloat = 10
-    /// App window: the button's centre lines up with the traffic lights.
-    private static let appMenuButtonTop: CGFloat = 1
+    /// App window: the button sits just below the traffic lights (16 pt
+    /// buttons 8 pt from the top and left), with the same 8 pt left inset.
+    private static let appMenuButtonLeading: CGFloat = 8
+    private static let appMenuButtonTop: CGFloat = 32
+    /// App window: the file name stays on the traffic-light row.
+    private static let appFileIconLeading: CGFloat = 84
+    private var fileIconLeading: NSLayoutConstraint?
 
     /// Shows the build stamp in the bottom-left corner. The app draws its own
     /// (in every window state), so only Quick Look turns this on.
     var showsBuildStamp = false {
         didSet {
             buildStampLabel.isHidden = !showsBuildStamp
-            fileNameLeading?.constant = showsBuildStamp ? Self.quickLookCornerInset : 84
-            menuButtonTop?.constant = showsBuildStamp ? Self.quickLookCornerInset : Self.appMenuButtonTop
+            updateTitleRow()
         }
     }
 
@@ -46,7 +53,6 @@ final class CADViewerSurface: NSView {
     /// already titles itself with the file name, so the preview turns this off.
     var showsFileName = true {
         didSet {
-            fileIcon.isHidden = !showsFileName || fileIcon.image == nil
             fileNameLabel.isHidden = !showsFileName
         }
     }
@@ -55,6 +61,15 @@ final class CADViewerSurface: NSView {
     var onOpenSettings: (() -> Void)? {
         get { viewCube.onOpenSettings }
         set { viewCube.onOpenSettings = newValue }
+    }
+
+    /// Quick Look: button in the panel corner, file name hidden. App: button
+    /// under the traffic lights, file name beside them.
+    private func updateTitleRow() {
+        let quickLook = showsBuildStamp
+        fileNameLeading?.constant = quickLook ? Self.quickLookCornerInset : Self.appMenuButtonLeading
+        menuButtonTop?.constant = quickLook ? Self.quickLookCornerInset : Self.appMenuButtonTop
+        fileIconLeading?.isActive = !quickLook
     }
 
     private(set) var representedURL: URL?
@@ -102,8 +117,6 @@ final class CADViewerSurface: NSView {
         showLoading(nil)
         representedURL = asset.url
         fileNameLabel.stringValue = asset.url.lastPathComponent
-        fileIcon.image = NSWorkspace.shared.icon(forFile: asset.url.path)
-        fileIcon.isHidden = !showsFileName
         let options = CADPreferences.displayOptions
         let scene = CADSceneFactory.makeScene(for: asset, options: options)
         sceneView.scene = scene
@@ -169,8 +182,6 @@ final class CADViewerSurface: NSView {
         addSubview(loadingLabel)
 
         fileIcon.translatesAutoresizingMaskIntoConstraints = false
-        fileIcon.imageScaling = .scaleProportionallyDown
-        fileIcon.isHidden = true
         addSubview(fileIcon)
         fileNameLabel.translatesAutoresizingMaskIntoConstraints = false
         fileNameLabel.font = helvetica(size: 13)
@@ -181,10 +192,12 @@ final class CADViewerSurface: NSView {
         let menuButton = viewCube.menuButton
         addSubview(menuButton)
         // Gear menu first in the title strip, then the file icon and name.
-        let leading = menuButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 84)
+        let leading = menuButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.appMenuButtonLeading)
         fileNameLeading = leading
         let menuTop = menuButton.topAnchor.constraint(equalTo: topAnchor, constant: Self.appMenuButtonTop)
         menuButtonTop = menuTop
+
+        fileIconLeading = fileIcon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.appFileIconLeading)
 
         buildStampLabel.translatesAutoresizingMaskIntoConstraints = false
         buildStampLabel.font = helvetica(size: 10)
@@ -209,14 +222,15 @@ final class CADViewerSurface: NSView {
             buildStampLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
             leading,
             menuTop,
-            fileIcon.leadingAnchor.constraint(equalTo: menuButton.trailingAnchor, constant: 6),
+            fileIcon.leadingAnchor.constraint(equalTo: menuButton.trailingAnchor, constant: 6).withPriority(.defaultLow),
             fileIcon.centerYAnchor.constraint(equalTo: topAnchor, constant: 15),
-            fileIcon.widthAnchor.constraint(equalToConstant: 16),
+            fileIcon.widthAnchor.constraint(equalToConstant: 0),
             fileIcon.heightAnchor.constraint(equalToConstant: 16),
-            fileNameLabel.leadingAnchor.constraint(equalTo: fileIcon.trailingAnchor, constant: 6),
+            fileNameLabel.leadingAnchor.constraint(equalTo: fileIcon.trailingAnchor),
             fileNameLabel.centerYAnchor.constraint(equalTo: fileIcon.centerYAnchor),
             fileNameLabel.trailingAnchor.constraint(lessThanOrEqualTo: viewCube.leadingAnchor, constant: -12)
         ])
+        updateTitleRow()
     }
 
     /// One label and one value, bottom-right. Helvetica, no backing panel.
@@ -333,5 +347,12 @@ final class CADViewerSurface: NSView {
         copyFlashTimer = nil
         measureValue.textColor = .labelColor
         resultCard.isHidden = false
+    }
+}
+
+private extension NSLayoutConstraint {
+    func withPriority(_ priority: NSLayoutConstraint.Priority) -> NSLayoutConstraint {
+        self.priority = priority
+        return self
     }
 }
