@@ -70,7 +70,9 @@ struct ContentView: View {
         .ignoresSafeArea(.container, edges: .top)
         .overlay(alignment: .top) {
             HStack(spacing: 0) {
-                Color.clear.frame(width: 82).allowsHitTesting(false)
+                // Traffic lights, then the viewer's gear menu button: both
+                // must stay clickable, so the drag strip starts after them.
+                Color.clear.frame(width: 118).allowsHitTesting(false)
                 Color.clear
                     .contentShape(Rectangle())
                     .allowsWindowActivationEvents(true)

@@ -34,7 +34,11 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
     }
 
     private let cubeView = CADOrientationCubeSceneView(frame: .zero, options: nil)
-    private let viewsButton = NSPopUpButton(frame: .zero, pullsDown: true)
+    private let viewsButton = NSButton(frame: .zero)
+    private var viewsMenu: NSMenu?
+    /// The gear button that opens the views and settings menu. The host
+    /// places it (top-left corner); the cube only owns the menu.
+    var menuButton: NSView { viewsButton }
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -46,21 +50,17 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
         cubeView.layer?.backgroundColor = NSColor.clear.cgColor
         cubeView.layer?.zPosition = 0
         addSubview(cubeView)
-        addSubview(viewsButton)
 
         configureViewsMenu()
         NSLayoutConstraint.activate([
             widthAnchor.constraint(equalToConstant: 130),
             heightAnchor.constraint(equalToConstant: 140),
-            // Cube in the corner, the settings chevron below it on the right.
             cubeView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 4),
             cubeView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -4),
             cubeView.topAnchor.constraint(equalTo: topAnchor),
             cubeView.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
-            viewsButton.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -9),
-            viewsButton.topAnchor.constraint(equalTo: cubeView.bottomAnchor, constant: -16),
-            viewsButton.widthAnchor.constraint(equalToConstant: 32),
-            viewsButton.heightAnchor.constraint(equalToConstant: 24)
+            viewsButton.widthAnchor.constraint(equalToConstant: 28),
+            viewsButton.heightAnchor.constraint(equalToConstant: 28)
         ])
         cubeView.cameraOrientation = cameraOrientation
     }
@@ -70,33 +70,27 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
     override var intrinsicContentSize: NSSize { NSSize(width: 130, height: 140) }
 
     private func configureViewsMenu() {
+        // A round glass button with the gear centred in it; clicking pops
+        // the menu up just below.
         viewsButton.title = ""
+        viewsButton.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: "Views and settings")
         viewsButton.imagePosition = .imageOnly
-        viewsButton.bezelStyle = .inline
-        viewsButton.controlSize = .small
-        viewsButton.isBordered = false
+        viewsButton.imageScaling = .scaleNone
+        viewsButton.bezelStyle = .glass
+        viewsButton.borderShape = .circle
+        viewsButton.controlSize = .regular
         viewsButton.contentTintColor = .labelColor
         viewsButton.focusRingType = .none
         viewsButton.toolTip = "Views and settings"
         viewsButton.setAccessibilityLabel("Views and settings")
         viewsButton.target = self
-        viewsButton.action = #selector(selectMenuItem(_:))
-        (viewsButton.cell as? NSPopUpButtonCell)?.arrowPosition = .noArrow
+        viewsButton.action = #selector(showMenu(_:))
         rebuildMenu()
     }
 
     private func rebuildMenu() {
         let menu = NSMenu(title: "Views and Settings")
         menu.delegate = self
-        // A pull-down uses its first item as the control's visible content.
-        // Keep that item empty so the compact control is only the native arrow.
-        let displayItem = NSMenuItem(title: "", action: nil, keyEquivalent: "")
-        displayItem.image = NSImage(
-            systemSymbolName: "chevron.down",
-            accessibilityDescription: "Views and settings"
-        )
-        menu.addItem(displayItem)
-
         // Every setting is one item with the choices in a submenu, so the
         // menu stays short.
         addSubmenu(to: menu, title: "Standard Views", prefix: "view",
@@ -144,9 +138,7 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
         }
 
         refreshChecks(in: menu)
-        viewsButton.menu = menu
-        viewsButton.selectItem(at: 0)
-        viewsButton.image = displayItem.image
+        viewsMenu = menu
     }
 
     @discardableResult
@@ -172,6 +164,11 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
         let item = NSMenuItem(title: title, action: #selector(selectChoice(_:)), keyEquivalent: "")
         item.target = self
         item.representedObject = "\(prefix):\(rawValue)"
+        // Settings apply without closing the menu, so several can be tried
+        // in a row. Standard views move the camera, so they close it.
+        if prefix != "view" {
+            item.view = CADMenuChoiceView(title: title) { [weak self] in self?.apply("\(prefix):\(rawValue)") }
+        }
         return item
     }
 
@@ -207,6 +204,7 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
             let rawValue = String(identifier[identifier.index(after: separator)...])
             guard let selected = selectedRawValue(for: prefix) else { continue }
             item.state = rawValue == selected ? .on : .off
+            item.view?.needsDisplay = true
         }
     }
 
@@ -250,7 +248,7 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
         default:
             break
         }
-        if let menu = viewsButton.menu { refreshChecks(in: menu) }
+        if let menu = viewsMenu { refreshChecks(in: menu) }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -259,18 +257,23 @@ final class CADOrientationWidgetView: NSView, NSMenuDelegate {
     }
 
     @objc private func openSettings(_ sender: NSMenuItem) {
-        viewsButton.selectItem(at: 0)
         onOpenSettings?()
     }
 
     @objc private func selectChoice(_ sender: NSMenuItem) {
         if let identifier = sender.representedObject as? String { apply(identifier) }
-        viewsButton.selectItem(at: 0)
     }
 
-    @objc private func selectMenuItem(_ sender: NSPopUpButton) {
-        if let identifier = sender.selectedItem?.representedObject as? String { apply(identifier) }
-        sender.selectItem(at: 0)
+    @objc private func showMenu(_ sender: NSButton) {
+        guard let menu = viewsMenu else { return }
+        let below = sender.isFlipped ? sender.bounds.maxY + 4 : sender.bounds.minY - 4
+        // Pop up after the click finishes, so the button shows a brief press
+        // and returns to normal instead of staying pressed while the menu is
+        // open (popUp runs its own tracking loop inside this call).
+        DispatchQueue.main.async { [weak sender] in
+            guard let sender else { return }
+            menu.popUp(positioning: nil, at: NSPoint(x: sender.bounds.minX, y: below), in: sender)
+        }
     }
 }
 
@@ -518,5 +521,57 @@ private final class CADOrientationCubeSceneView: SCNView {
         cameraNode.simdOrientation = cameraOrientation
         cameraNode.simdPosition = cubeCenter.simdVector + backward * 5
         setNeedsDisplay(bounds)
+    }
+}
+
+/// A menu row that applies its choice on click and leaves the menu open.
+/// NSMenu closes after any ordinary item is chosen; an item with a custom
+/// view handles its own clicks, so this one draws like a standard row
+/// (checkmark, title, rounded highlight) and runs `onChoose` in place.
+@MainActor
+private final class CADMenuChoiceView: NSView {
+    private let title: String
+    private let onChoose: () -> Void
+    private static let font = NSFont.menuFont(ofSize: 0)
+    private static let checkWidth: CGFloat = 22
+    private static let horizontalInset: CGFloat = 5
+
+    init(title: String, onChoose: @escaping () -> Void) {
+        self.title = title
+        self.onChoose = onChoose
+        let textWidth = (title as NSString).size(withAttributes: [.font: Self.font]).width
+        super.init(frame: NSRect(x: 0, y: 0, width: ceil(textWidth) + Self.checkWidth + 40, height: 24))
+        autoresizingMask = [.width]
+        setAccessibilityRole(.menuItem)
+        setAccessibilityLabel(title)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let item = enclosingMenuItem
+        let highlighted = item?.isHighlighted ?? false
+        if highlighted {
+            NSColor.selectedContentBackgroundColor.setFill()
+            NSBezierPath(roundedRect: bounds.insetBy(dx: Self.horizontalInset, dy: 0), xRadius: 6, yRadius: 6).fill()
+        }
+        let color: NSColor = highlighted ? .selectedMenuItemTextColor : .labelColor
+        let attributes: [NSAttributedString.Key: Any] = [.font: Self.font, .foregroundColor: color]
+        let textHeight = (title as NSString).size(withAttributes: attributes).height
+        let baseline = (bounds.height - textHeight) / 2
+        if item?.state == .on {
+            ("✓" as NSString).draw(at: NSPoint(x: Self.horizontalInset + 6, y: baseline), withAttributes: attributes)
+        }
+        (title as NSString).draw(at: NSPoint(x: Self.horizontalInset + Self.checkWidth, y: baseline), withAttributes: attributes)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        onChoose()
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        onChoose()
+        return true
     }
 }

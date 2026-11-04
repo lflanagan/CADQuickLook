@@ -21,16 +21,24 @@ final class CADViewerSurface: NSView {
     /// File icon + name in the title strip, inline with the traffic lights.
     private let fileIcon = NSImageView()
     private let fileNameLabel = NSTextField(labelWithString: "")
-    /// Left inset of the file name: past the traffic lights (app window) or
+    /// Left inset of the gear menu (then file name): past the traffic lights (app window) or
     /// flush with the panel edge (Quick Look has no traffic lights).
     private var fileNameLeading: NSLayoutConstraint?
+    private var menuButtonTop: NSLayoutConstraint?
+    /// Quick Look has no traffic lights, so the menu button sits in the
+    /// panel's corner, inset the same from the top and the left so its
+    /// circle reads as concentric with the rounded corner.
+    private static let quickLookCornerInset: CGFloat = 10
+    /// App window: the button's centre lines up with the traffic lights.
+    private static let appMenuButtonTop: CGFloat = 1
 
     /// Shows the build stamp in the bottom-left corner. The app draws its own
     /// (in every window state), so only Quick Look turns this on.
     var showsBuildStamp = false {
         didSet {
             buildStampLabel.isHidden = !showsBuildStamp
-            fileNameLeading?.constant = showsBuildStamp ? 16 : 84
+            fileNameLeading?.constant = showsBuildStamp ? Self.quickLookCornerInset : 84
+            menuButtonTop?.constant = showsBuildStamp ? Self.quickLookCornerInset : Self.appMenuButtonTop
         }
     }
 
@@ -170,8 +178,13 @@ final class CADViewerSurface: NSView {
         fileNameLabel.lineBreakMode = .byTruncatingMiddle
         fileNameLabel.maximumNumberOfLines = 1
         addSubview(fileNameLabel)
-        let leading = fileIcon.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 84)
+        let menuButton = viewCube.menuButton
+        addSubview(menuButton)
+        // Gear menu first in the title strip, then the file icon and name.
+        let leading = menuButton.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 84)
         fileNameLeading = leading
+        let menuTop = menuButton.topAnchor.constraint(equalTo: topAnchor, constant: Self.appMenuButtonTop)
+        menuButtonTop = menuTop
 
         buildStampLabel.translatesAutoresizingMaskIntoConstraints = false
         buildStampLabel.font = helvetica(size: 10)
@@ -195,6 +208,8 @@ final class CADViewerSurface: NSView {
             buildStampLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             buildStampLabel.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -10),
             leading,
+            menuTop,
+            fileIcon.leadingAnchor.constraint(equalTo: menuButton.trailingAnchor, constant: 6),
             fileIcon.centerYAnchor.constraint(equalTo: topAnchor, constant: 15),
             fileIcon.widthAnchor.constraint(equalToConstant: 16),
             fileIcon.heightAnchor.constraint(equalToConstant: 16),
